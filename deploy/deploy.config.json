@@ -1,0 +1,40 @@
+{
+  "prefix": "/opt/tinycoder-openai",
+  "config_dir": "/etc/tinycoder",
+  "systemd_dir": "/etc/systemd/system",
+  "user": "tinycoder",
+  "group": "tinycoder",
+
+  "artifacts": [
+    {
+      "source": "build/bin/tinycoder-openai",
+      "dest": "${prefix}/tinycoder-openai",
+      "mode": "0755",
+      "required": true
+    },
+    {
+      "source": "build/native/libtinycoder_bridge.so",
+      "dest": "${prefix}/lib/libtinycoder_bridge.so",
+      "mode": "0755"
+    },
+    {
+      "source": "config.example.json",
+      "dest": "${config_dir}/config.json",
+      "mode": "0640",
+      "if_missing": true
+    },
+    {
+      "source": "deploy/tinycoder-openai.service",
+      "dest": "${systemd_dir}/tinycoder-openai.service",
+      "mode": "0644",
+      "required": true
+    }
+  ],
+
+  "service": {
+    "unit": "tinycoder-openai.service",
+    "reload": true,
+    "enable": true,
+    "restart": true
+  }
+}
