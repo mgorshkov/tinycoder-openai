@@ -1,0 +1,80 @@
+{
+  "listen": ":8080",
+  "public_url": "https://api.tinycoder.dev/v1",
+  "api_keys": [],
+  "tool_calling": true,
+  "allowed_origins": ["*"],
+
+  "models_dir": "/data/models",
+  "scan_models_dir": false,
+  "max_loaded_models": 1,
+  "idle_timeout_sec": 900,
+
+  "n_threads": 0,
+  "max_seq_len": 8192,
+  "default_max_tokens": 2048,
+  "max_prompt_tokens": 32768,
+  "request_timeout_sec": 600,
+  "no_token_timeout_sec": 120,
+  "hard_timeout_sec": 660,
+  "max_concurrent_requests": 1,
+
+  "log_level": "info",
+
+  "models": [
+    {
+      "id": "qwen3.6-35b-a3b",
+      "name": "Qwen3.6-35B-A3B",
+      "file": "qwen/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+      "architecture": "qwen35moe",
+      "quantization": "UD-Q4_K_M",
+      "context_length": 8192,
+      "description": "35B-A3B mixture-of-experts coding model (recommended)."
+    },
+    {
+      "id": "qwen3.8-27b",
+      "name": "Qwen3.8-27B",
+      "file": "qwen/Qwen3.8-27B-UD-Q4_K_M.gguf",
+      "architecture": "qwen35",
+      "quantization": "UD-Q4_K_M",
+      "context_length": 8192,
+      "description": "27B dense hybrid (gated-delta-net + full attention)."
+    },
+    {
+      "id": "qwen2.5-coder-1.5b",
+      "name": "Qwen2.5-Coder-1.5B",
+      "file": "qwen/Qwen2.5-Coder-1.5B-Instruct-Q2_K.gguf",
+      "architecture": "qwen2",
+      "quantization": "Q2_K",
+      "context_length": 4096,
+      "description": "Lightweight fast coding model."
+    },
+    {
+      "id": "qwen2.5-coder-7b",
+      "name": "Qwen2.5-Coder-7B",
+      "file": "qwen/Qwen2.5-Coder-7B-Instruct-IQ3_XXS.gguf",
+      "architecture": "qwen2",
+      "quantization": "IQ3_XXS",
+      "context_length": 4096,
+      "description": "Recommended balanced 7B coding model."
+    },
+    {
+      "id": "gemma4-26b-a4b",
+      "name": "Gemma 4 26B-A4B IT",
+      "file": "gemma/gemma-4-26b-a4b-it-Q4_K_XL.gguf",
+      "architecture": "gemma4",
+      "quantization": "Q4_K_XL",
+      "context_length": 8192,
+      "description": "Instruction-tuned Gemma MoE."
+    },
+    {
+      "id": "bonsai-2-27b",
+      "name": "Ternary Bonsai 2 27B",
+      "file": "bonsai/Ternary-Bonsai-2-27B-PQ2_0.gguf",
+      "architecture": "bonsai",
+      "quantization": "Q2_0",
+      "context_length": 8192,
+      "description": "27B ternary-weight model (Q2_0) — extremely low-bit footprint."
+    }
+  ]
+}
