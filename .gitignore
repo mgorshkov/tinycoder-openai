@@ -1,0 +1,14 @@
+# Build artifacts
+/build/
+/tinycoder-openai
+*.o
+*.a
+
+# Go
+*.test
+*.out
+
+# Editor
+.vscode/
+.idea/
+*.swp
