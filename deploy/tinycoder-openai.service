@@ -1,0 +1,38 @@
+[Unit]
+Description=TinyCoder OpenAPI inference provider
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tinycoder
+Group=tinycoder
+WorkingDirectory=/opt/tinycoder-openai
+
+EnvironmentFile=-/etc/tinycoder/tinycoder-openai.env
+Environment=LD_LIBRARY_PATH=/opt/tinycoder-openai/lib
+
+ExecStart=/opt/tinycoder-openai/tinycoder-openai \
+    --config /etc/tinycoder/config.json \
+    --listen :8080
+
+Restart=on-failure
+RestartSec=5s
+
+# Generous timeout for model loading on first request.
+TimeoutStartSec=0
+
+# Hardening.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/data/models
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
