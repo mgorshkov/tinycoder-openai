@@ -12,7 +12,9 @@ import (
 	"time"
 )
 
-// RegistryModel describes one model exposed by /v1/models.
+// RegistryModel describes one model exposed by /v1/models. File is the model
+// path relative to ModelsDir (or absolute): either a GGUF file or an EXL3
+// checkpoint directory. The engine auto-detects the format.
 type RegistryModel struct {
 	ID            string `json:"id"`
 	Name          string `json:"name"`

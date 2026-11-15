@@ -41,6 +41,15 @@
       "description": "27B dense hybrid (gated-delta-net + full attention)."
     },
     {
+      "id": "exlv3",
+      "name": "Qwen3.8-27B EXL3 1.60bpw",
+      "file": "qwen/qwen3.8-27b/qwen3.8-27B-exl3-1.60bpw",
+      "architecture": "qwen35",
+      "quantization": "EXL3-1.60bpw",
+      "context_length": 8192,
+      "description": "27B dense hybrid loaded from an EXL3 (ExLlamaV3) 1.60 bpw safetensors checkpoint directory."
+    },
+    {
       "id": "qwen2.5-coder-1.5b",
       "name": "Qwen2.5-Coder-1.5B",
       "file": "qwen/Qwen2.5-Coder-1.5B-Instruct-Q2_K.gguf",
