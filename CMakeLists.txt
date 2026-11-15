@@ -113,6 +113,24 @@ target_include_directories(tinycoder_bridge PRIVATE
 target_compile_features(tinycoder_bridge PRIVATE cxx_std_20)
 target_link_libraries(tinycoder_bridge PRIVATE tinycoder_core)
 
+# The engine's shared cmake module (np/cmake Globals.cmake) enables OpenMP by
+# appending OpenMP_CXX_FLAGS to CMAKE_CXX_FLAGS and OpenMP_EXE_LINKER_FLAGS to
+# CMAKE_EXE_LINKER_FLAGS only. Executables therefore link libgomp, but a SHARED
+# library target does not: the linker happily leaves omp_*/GOMP_* symbols
+# undefined in libtinycoder_bridge.so, and the cgo link of the Go binary then
+# fails with "undefined reference to omp_get_thread_num/GOMP_parallel".
+# Link the OpenMP runtime into the .so explicitly so it records its own
+# dependency (DT_NEEDED libgomp) and the cgo link stays a plain
+# -ltinycoder_bridge.
+if(ENABLE_OPENMP)
+    find_package(OpenMP)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(tinycoder_bridge PRIVATE OpenMP::OpenMP_CXX)
+    else()
+        message(WARNING "tinycoder-openai: ENABLE_OPENMP is ON but OpenMP was not found; the bridge may contain unresolved omp_* symbols")
+    endif()
+endif()
+
 # When CUDA is enabled, make CMake run the device-link step on the bridge so the
 # __cudaRegisterLinkedBinary_* thunks pulled from the tinycoder_core static
 # library are resolved. cudadevrt provides the device-side runtime those linked

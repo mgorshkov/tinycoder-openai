@@ -46,6 +46,8 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/v1/generate", s.handleGenerate)
 	mux.HandleFunc("/v1/completions", s.handleCompletions)
 	mux.HandleFunc("/v1/chat/completions", s.handleChatCompletions)
+	mux.HandleFunc("/v1/responses", s.handleResponses)
+	mux.HandleFunc("/v1/messages", s.handleMessages)
 
 	// Operational endpoints.
 	mux.HandleFunc("/healthz", s.handleHealth)
@@ -98,21 +100,28 @@ func (s *Server) originAllowed(origin string) bool {
 	return false
 }
 
-// authorize enforces API-key authentication. Any key configured via api_keys is
-// accepted; a missing or unknown key is rejected with 401. When no keys are
-// configured the server is open.
-func (s *Server) authorize(w http.ResponseWriter, r *http.Request) bool {
+// authorized reports whether the request carries a valid API key. When no keys
+// are configured the server is open.
+func (s *Server) authorized(r *http.Request) bool {
 	keys := s.cfg.AuthKeySet()
 	if len(keys) == 0 {
 		return true
 	}
 	token := apiKeyFromRequest(r)
-	if _, ok := keys[token]; token == "" || !ok {
-		w.Header().Set("WWW-Authenticate", "Bearer")
-		writeError(w, http.StatusUnauthorized, "invalid or missing API key", "authentication_error", "invalid_api_key")
-		return false
+	_, ok := keys[token]
+	return token != "" && ok
+}
+
+// authorize enforces API-key authentication. Any key configured via api_keys is
+// accepted; a missing or unknown key is rejected with 401. When no keys are
+// configured the server is open.
+func (s *Server) authorize(w http.ResponseWriter, r *http.Request) bool {
+	if s.authorized(r) {
+		return true
 	}
-	return true
+	w.Header().Set("WWW-Authenticate", "Bearer")
+	writeError(w, http.StatusUnauthorized, "invalid or missing API key", "authentication_error", "invalid_api_key")
+	return false
 }
 
 // apiKeyFromRequest extracts a presented API key from the request, accepting the

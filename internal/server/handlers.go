@@ -222,24 +222,27 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, chatRe
 	})
 }
 
-// buildRequest validates the request and resolves it to an engine.GenerateRequest.
-func (s *Server) buildRequest(req generationRequest, chatRequired bool, toolInstr string) (engine.GenerateRequest, string, error) {
-	modelID := req.Model
-	if modelID == "" {
-		if len(s.cfg.Models) == 1 {
-			modelID = s.cfg.Models[0].ID
-		}
+// resolveModelID applies the request's model id (defaulting to the only
+// registry model) and enforces the config registry, which is the single source
+// of truth for which ids the API will serve.
+func (s *Server) resolveModelID(modelID string) (string, error) {
+	if modelID == "" && len(s.cfg.Models) == 1 {
+		modelID = s.cfg.Models[0].ID
 	}
 	if modelID == "" {
-		return engine.GenerateRequest{}, "", errors.New("field 'model' is required")
+		return "", errors.New("field 'model' is required")
 	}
-	// Enforce the config registry on every generation endpoint: a model id that
-	// is not declared in the config file is rejected with 404, even if a matching
-	// GGUF exists on disk (models_dir is not the serving registry).
+	// A model id that is not declared in the config file is rejected with 404,
+	// even if a matching GGUF exists on disk (models_dir is not the registry).
 	if !s.modelInRegistry(modelID) {
-		return engine.GenerateRequest{}, modelID, fmt.Errorf("%w: %s", ErrModelNotFound, modelID)
+		return modelID, fmt.Errorf("%w: %s", ErrModelNotFound, modelID)
 	}
+	return modelID, nil
+}
 
+// newGenerateRequest applies the default sampling parameters and the
+// max_prompt_tokens policy shared by every generation endpoint.
+func (s *Server) newGenerateRequest(maxTokens *int, temperature, topP, topK *float32) (engine.GenerateRequest, error) {
 	out := engine.GenerateRequest{
 		MaxTokens:     s.cfg.DefaultMaxTokens,
 		Temperature:   0.7,
@@ -248,26 +251,17 @@ func (s *Server) buildRequest(req generationRequest, chatRequired bool, toolInst
 		RepeatPenalty: 1.1,
 		RepeatLastN:   64,
 	}
-	if req.MaxTokens != nil {
-		out.MaxTokens = *req.MaxTokens
+	if maxTokens != nil {
+		out.MaxTokens = *maxTokens
 	}
-	if req.Temperature != nil {
-		out.Temperature = *req.Temperature
+	if temperature != nil {
+		out.Temperature = *temperature
 	}
-	if req.TopP != nil {
-		out.TopP = *req.TopP
+	if topP != nil {
+		out.TopP = *topP
 	}
-	if req.TopK != nil {
-		out.TopK = *req.TopK
-	}
-	if req.RepeatPenalty != nil {
-		out.RepeatPenalty = *req.RepeatPenalty
-	}
-	if req.RepeatLastN != nil {
-		out.RepeatLastN = *req.RepeatLastN
-	}
-	if req.Seed != nil {
-		out.Seed = *req.Seed
+	if topK != nil {
+		out.TopK = *topK
 	}
 
 	// max_prompt_tokens is a server-side ceiling on generation length, not a
@@ -279,16 +273,39 @@ func (s *Server) buildRequest(req generationRequest, chatRequired bool, toolInst
 	// max_prompt_tokens. A request that asks for less than one token is still a
 	// client error.
 	if out.MaxTokens < 1 {
-		return out, modelID, errors.New("max_tokens must be at least 1")
+		return out, errors.New("max_tokens must be at least 1")
 	}
 	if out.MaxTokens > s.cfg.MaxPromptTokens {
 		out.MaxTokens = s.cfg.MaxPromptTokens
 	}
 	if out.Temperature < 0 || out.Temperature > 2 {
-		return out, modelID, errors.New("temperature must be between 0 and 2")
+		return out, errors.New("temperature must be between 0 and 2")
 	}
 	if out.TopP < 0 || out.TopP > 1 {
-		return out, modelID, errors.New("top_p must be between 0 and 1")
+		return out, errors.New("top_p must be between 0 and 1")
+	}
+	return out, nil
+}
+
+// buildRequest validates the request and resolves it to an engine.GenerateRequest.
+func (s *Server) buildRequest(req generationRequest, chatRequired bool, toolInstr string) (engine.GenerateRequest, string, error) {
+	modelID, err := s.resolveModelID(req.Model)
+	if err != nil {
+		return engine.GenerateRequest{}, modelID, err
+	}
+
+	out, err := s.newGenerateRequest(req.MaxTokens, req.Temperature, req.TopP, req.TopK)
+	if err != nil {
+		return out, modelID, err
+	}
+	if req.RepeatPenalty != nil {
+		out.RepeatPenalty = *req.RepeatPenalty
+	}
+	if req.RepeatLastN != nil {
+		out.RepeatLastN = *req.RepeatLastN
+	}
+	if req.Seed != nil {
+		out.Seed = *req.Seed
 	}
 
 	if len(req.Chat) > 0 {
@@ -588,6 +605,20 @@ func (s *sseWriter) comment(text string) {
 	s.flusher.Flush()
 }
 
+// writeEvent emits one SSE event with an explicit event name, used by the
+// Responses and Messages APIs whose streams are typed (and, unlike Chat
+// Completions, carry no [DONE] sentinel).
+func (s *sseWriter) writeEvent(event string, v any) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fmt.Fprintf(s.w, "event: %s\ndata: %s\n\n", event, data)
+	s.flusher.Flush()
+}
+
 // writeDone emits the terminating [DONE] sentinel.
 func (s *sseWriter) writeDone() {
 	s.mu.Lock()
@@ -630,10 +661,15 @@ func toUsageDTO(u engine.Usage) usageDTO {
 }
 
 // newID returns an id like "chatcmpl-<16 hex chars>" using crypto/rand.
-func newID(prefix string) string {
+func newID(prefix string) string { return newIDSep(prefix, "-") }
+
+// newIDSep returns an id using the given prefix/separator, e.g. the
+// underscore-separated "resp_..." / "msg_..." ids of the Responses and Messages
+// APIs.
+func newIDSep(prefix, sep string) string {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		return prefix + "-0000000000000000"
+		return prefix + sep + "0000000000000000"
 	}
-	return prefix + "-" + hex.EncodeToString(b[:])
+	return prefix + sep + hex.EncodeToString(b[:])
 }
