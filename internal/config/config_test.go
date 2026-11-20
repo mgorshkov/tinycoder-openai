@@ -102,6 +102,30 @@ func TestAuthKeySet(t *testing.T) {
 	}
 }
 
+func TestMaxConcurrentDefaultsToModelCount(t *testing.T) {
+	cfg := Default()
+	if cfg.MaxConcurrent != 0 {
+		t.Fatalf("zero value should mean auto, got %d", cfg.MaxConcurrent)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if want := len(cfg.Models); cfg.MaxConcurrent != want {
+		t.Fatalf("resolved max_concurrent_requests = %d, want %d (one per model)",
+			cfg.MaxConcurrent, want)
+	}
+
+	// An explicit value survives validation unchanged.
+	explicit := Default()
+	explicit.MaxConcurrent = 1
+	if err := explicit.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if explicit.MaxConcurrent != 1 {
+		t.Fatalf("explicit max_concurrent_requests = %d, want 1", explicit.MaxConcurrent)
+	}
+}
+
 func TestValidateRejectsDuplicates(t *testing.T) {
 	cfg := Default()
 	cfg.Models = []RegistryModel{{ID: "a", File: "a.gguf"}, {ID: "a", File: "b.gguf"}}

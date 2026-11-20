@@ -50,7 +50,17 @@ type Manager struct {
 	order   []string // creation order for deterministic iteration
 
 	// sem bounds the number of in-flight generation requests across all models.
+	// It is admission (queue depth) only: a caller holding a slot has not
+	// necessarily started generating.
 	sem chan struct{}
+
+	// exec serializes actual engine calls across all models. The native engine is
+	// single-tenant — one process-wide ThreadPool task slot and one GPU device —
+	// so two resident models must not run forward() at the same time. This is
+	// what makes max_concurrent_requests > 1 safe today (the semaphore alone
+	// would let two models enter Generate concurrently and race the pool); it
+	// goes away with continuous batching.
+	exec sync.Mutex
 
 	stopOnce sync.Once
 	stopCh   chan struct{}
@@ -61,6 +71,11 @@ type Manager struct {
 func NewManager(cfg config.Config, factory engine.Factory, log *slog.Logger) *Manager {
 	if log == nil {
 		log = slog.Default()
+	}
+	if cfg.MaxConcurrent < 1 {
+		// Validate resolves 0 to one slot per model; guard direct construction
+		// (tests, embedders) so a zero-capacity semaphore cannot deadlock.
+		cfg.MaxConcurrent = 1
 	}
 	m := &Manager{
 		cfg:     cfg,
@@ -235,6 +250,11 @@ func (m *Manager) Acquire(ctx context.Context, id string) (*Lease, error) {
 		NThreads:  m.cfg.NThreads,
 		MaxSeqLen: e.cfg.ContextLength,
 	}
+	// The engine gives each model a private thread pool, so a model may size it
+	// independently (e.g. a small model on few threads next to a large one).
+	if e.cfg.NThreads > 0 {
+		opts.NThreads = e.cfg.NThreads
+	}
 	if opts.MaxSeqLen == 0 {
 		opts.MaxSeqLen = m.cfg.MaxSeqLen
 	}
@@ -370,5 +390,8 @@ func (m *Manager) Generate(ctx context.Context, id string, req engine.GenerateRe
 	if req.HardTimeout <= 0 {
 		req.HardTimeout = m.cfg.HardRequestTimeout()
 	}
+
+	m.exec.Lock()
+	defer m.exec.Unlock()
 	return lease.Model().Generate(ctx, req, onToken)
 }

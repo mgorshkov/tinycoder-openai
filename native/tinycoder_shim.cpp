@@ -249,10 +249,11 @@ int tc_engine_set_threads(tc_engine_t engine, int n_threads) {
     clearError();
     (void) engine;
     try {
-        // The persistent pool is a process-wide singleton created once; the
-        // first call after process start wins. This is the ONLY place the pool
-        // is initialized, so before it every parallelFor ran serially (0%
-        // multi-core utilisation).
+        // Kept for ABI compatibility. Models now own their thread pools (created
+        // in Model::load from the n_threads passed to tc_engine_load), so this
+        // only sizes the process-wide fallback instance used when no pool is
+        // bound to the calling thread (bench, unit tests). The Go server does not
+        // call it any more.
         auto &pool = tinycoder::ThreadPool::instance();
         if (!pool.isInitialized()) {
             if (n_threads > 0) {

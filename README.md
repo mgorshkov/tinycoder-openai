@@ -130,7 +130,9 @@ to read the manifest; destination directories are created as needed.
   unloaded after an idle timeout; resident models are capped by
   `max_loaded_models`.
 - **Per-model request serialization**: the engine uses a single KV cache, so
-  concurrent requests for the same model are queued.
+  concurrent requests for the same model are queued. `max_concurrent_requests`
+  defaults to one slot per registered model and bounds admission (queue depth);
+  the engine itself still executes one request at a time.
 - **OpenAPI 3.1 spec** served at `/openai.json` and `/openai.yaml`.
 - **Optional bearer-token auth**, configurable CORS, request timeouts and a
   global concurrency limit.
@@ -250,10 +252,17 @@ pre-formatted prompt.
 
 ### Concurrency model
 
-- One `engine.Engine` instance per registry model.
+- One `engine.Engine` instance per registry model, and one CPU thread pool per
+  loaded model inside the engine (sized by `n_threads`, overridable per model).
 - `entry.mu` serializes load/unload/generate for a model — required because the
   C++ engine owns a single KV cache and clears it per request.
-- `Manager.sem` caps total in-flight generations (`max_concurrent_requests`).
+- `Manager.sem` bounds admission: at most `max_concurrent_requests` requests are
+  in flight, and the default is one slot per registered model (`0` in the
+  config resolves to that).
+- `Manager.exec` serializes the engine call itself across *all* models: the
+  native engine shares one process-wide thread pool and one GPU, so two resident
+  models must not generate at once. Increasing `max_concurrent_requests` changes
+  how many requests wait, not how many run.
 - The idle loop unloads models idle longer than `idle_timeout_sec`.
 - With `max_loaded_models = N`, the manager guarantees at most `N` resident
   models by evicting the least-recently-used idle one when loading another.
@@ -284,11 +293,14 @@ Other environment variables: `TINYCODER_MAX_LOADED_MODELS`,
 `TINYCODER_ALLOWED_ORIGINS` (comma-separated), `TINYCODER_API_KEYS`
 (comma-separated), `TINYCODER_TOOL_CALLING`, `TINYCODER_SCAN_MODELS_DIR`.
 
-`n_threads` (`TINYCODER_THREADS`) initializes the engine's shared CPU worker
-pool; `0` uses every logical CPU. `no_token_timeout_sec` aborts a generation that
-emits no token for that long (a hung load/prefill guard; reported to the client
-as `504` with code `no_token`). `hard_timeout_sec` bounds the total wall-clock
-time of one generation (reported as `504` with code `timeout`).
+`n_threads` (`TINYCODER_THREADS`) sizes each model's CPU worker pool — the
+engine gives every model its own, so `n_threads` on a `models[]` entry overrides
+the global value for that model (useful for running a small model on a few
+threads beside a large one). `0` uses every logical CPU. `no_token_timeout_sec`
+aborts a generation that emits no token for that long (a hung load/prefill guard;
+reported to the client as `504` with code `no_token`). `hard_timeout_sec` bounds
+the total wall-clock time of one generation (reported as `504` with code
+`timeout`).
 
 Aborts are cooperative and safe: on timeout, client disconnect or the no-token
 guard, the server signals the engine's per-layer / per-block abort predicate and

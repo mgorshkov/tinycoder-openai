@@ -63,11 +63,11 @@ func (e *Engine) Load(ctx context.Context, opts engine.LoadOptions) error {
 			return fmt.Errorf("%w: could not construct engine: %s", engine.ErrUnavailable, lastError())
 		}
 	}
-	// Configure the shared CPU thread pool BEFORE loading so the configured
-	// n_threads (TINYCODER_THREADS / config) engages multiple workers. Without
-	// this the pool is never created and every parallel region runs serially on
-	// one core. 0 lets the engine choose (all logical CPUs).
-	C.tc_engine_set_threads(e.handle, C.int(opts.NThreads))
+	// Each model gets its own CPU thread pool inside the engine, created from
+	// the n_threads passed to tc_engine_load: opts.NThreads is the model's
+	// override (RegistryModel.NThreads) or the global default. There is no
+	// process-wide pool to configure first any more, so no tc_engine_set_threads
+	// call: 0 lets the engine pick (all logical CPUs).
 	cPath := C.CString(opts.ModelPath)
 	defer C.free(unsafe.Pointer(cPath))
 	if rc := C.tc_engine_load(e.handle, cPath, C.int(opts.NThreads), C.int(opts.MaxSeqLen)); rc != 0 {
