@@ -22,8 +22,11 @@ type RegistryModel struct {
 	Architecture  string `json:"architecture,omitempty"`
 	Quantization  string `json:"quantization,omitempty"`
 	ContextLength int    `json:"context_length,omitempty"`
-	SizeBytes     int64  `json:"size_bytes,omitempty"`
-	Description   string `json:"description,omitempty"`
+	// NThreads overrides the global n_threads for this model's own CPU thread
+	// pool (the engine gives every model a private pool). 0 inherits n_threads.
+	NThreads    int    `json:"n_threads,omitempty"`
+	SizeBytes   int64  `json:"size_bytes,omitempty"`
+	Description string `json:"description,omitempty"`
 }
 
 // Config is the fully resolved server configuration.
@@ -80,9 +83,13 @@ func Default() Config {
 		RequestTimeoutSec: 600,
 		NoTokenTimeoutSec: 120,
 		HardTimeoutSec:    660,
-		MaxConcurrent:     1,
-		LogLevel:          "info",
-		Models:            builtinModels(),
+		// 0 means "one slot per registered model", resolved in Validate. The
+		// engine runs one request at a time, so this bounds how many requests may
+		// wait for a model, not how many run; set it explicitly to change the
+		// queue depth.
+		MaxConcurrent: 0,
+		LogLevel:      "info",
+		Models:        builtinModels(),
 	}
 }
 
@@ -243,6 +250,16 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxLoadedModels < 1 {
 		return fmt.Errorf("max_loaded_models must be >= 1")
+	}
+	if c.MaxConcurrent == 0 {
+		// Default: one admission slot per registered model, so a request for one
+		// model never waits behind a request for another at the semaphore. The
+		// engine still executes one request at a time (see Manager.exec); this is
+		// queue depth, not parallelism.
+		c.MaxConcurrent = len(c.Models)
+		if c.MaxConcurrent < 1 {
+			c.MaxConcurrent = 1
+		}
 	}
 	if c.MaxConcurrent < 1 {
 		return fmt.Errorf("max_concurrent_requests must be >= 1")
