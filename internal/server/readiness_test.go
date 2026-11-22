@@ -115,6 +115,23 @@ func (e *gatedEngine) Load(ctx context.Context, opts engine.LoadOptions) error {
 	}
 }
 
+// ctxIgnoringEngine blocks Load until release is closed and ignores the context
+// entirely, modeling the native engine's blocking C load.
+type ctxIgnoringEngine struct {
+	*engine.Stub
+	started  chan struct{}
+	release  chan struct{}
+	returned chan struct{}
+	once     sync.Once
+}
+
+func (e *ctxIgnoringEngine) Load(ctx context.Context, opts engine.LoadOptions) error {
+	e.once.Do(func() { close(e.started) })
+	<-e.release
+	close(e.returned)
+	return e.Stub.Load(ctx, opts)
+}
+
 // failingEngine fails its first `failures` Load calls, then succeeds.
 type failingEngine struct {
 	*engine.Stub
@@ -265,6 +282,76 @@ func TestReadyzWarmupTimeout(t *testing.T) {
 	msg := strings.ToLower(body.Models[0].Error)
 	if !strings.Contains(msg, "timed out") || !strings.Contains(msg, "1s") {
 		t.Fatalf("/readyz model error = %q, want it to name the timeout", body.Models[0].Error)
+	}
+}
+
+// A native model load is a blocking C call that cannot be canceled. The budget
+// must still be reported: /readyz turns to 503 error with the timeout message
+// once preload_timeout_sec has elapsed even while Load is still blocked, and
+// flips to 200 ready when the load finally completes.
+func TestReadyzWarmupTimeoutWhileLoadIgnoresContext(t *testing.T) {
+	cfg := preloadTestConfig()
+	cfg.PreloadTimeoutSec = 1
+	started := make(chan struct{})
+	release := make(chan struct{})
+	returned := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseLoad := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseLoad)
+
+	srv, ts := newPreloadServer(t, cfg, func(id string) engine.Engine {
+		return &ctxIgnoringEngine{
+			Stub:     engine.NewStub(id),
+			started:  started,
+			release:  release,
+			returned: returned,
+		}
+	})
+
+	start := time.Now()
+	srv.StartPreload()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("warm-up never started")
+	}
+
+	code, body := waitReadyz(t, ts.URL, "error")
+	elapsed := time.Since(start)
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("/readyz status after the budget expired = %d, want 503", code)
+	}
+	if elapsed < 900*time.Millisecond {
+		t.Fatalf("warm-up reported the timeout after %s, want about the 1s budget", elapsed)
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("warm-up reported the timeout after %s, want about the 1s budget", elapsed)
+	}
+	if len(body.Models) != 1 || body.Models[0].Loaded {
+		t.Fatalf("/readyz models after the budget expired = %+v, want alpha not loaded", body.Models)
+	}
+	msg := strings.ToLower(body.Models[0].Error)
+	if !strings.Contains(msg, "timed out") || !strings.Contains(msg, "1s") {
+		t.Fatalf("/readyz model error = %q, want it to name the timeout", body.Models[0].Error)
+	}
+	// The engine load must still be blocked: the timeout is reported, not
+	// enforced by abandoning the call.
+	select {
+	case <-returned:
+		t.Fatal("Load returned before release; the timeout must be reporting-only")
+	default:
+	}
+	if code := getHealthz(t, ts.URL); code != http.StatusOK {
+		t.Fatalf("/healthz while the load is blocked = %d, want 200", code)
+	}
+
+	releaseLoad()
+	code, body = waitReadyz(t, ts.URL, "ready")
+	if code != http.StatusOK {
+		t.Fatalf("/readyz after the load completed = %d, want 200", code)
+	}
+	if len(body.Models) != 1 || !body.Models[0].Loaded || body.Models[0].Error != "" {
+		t.Fatalf("/readyz models after the load completed = %+v, want alpha loaded with no error", body.Models)
 	}
 }
 

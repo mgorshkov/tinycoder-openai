@@ -62,8 +62,10 @@ type Manager struct {
 	// independent of mu/e.mu: Readiness must stay cheap and never block behind a
 	// load or a generation.
 	preloadMu   sync.Mutex
-	warm        map[string]bool   // models warmed at least once (sticky)
-	preloadErrs map[string]string // last warm-up failure per model
+	warm        map[string]bool      // models warmed at least once (sticky)
+	preloadErrs map[string]string    // last warm-up failure per model
+	preloadAt   map[string]time.Time // warm-up start per target (for budget reporting)
+	preloadMax  time.Duration        // configured per-target warm-up budget (0 disables)
 
 	// exec serializes actual engine calls across all models. The native engine is
 	// single-tenant — one process-wide ThreadPool task slot and one GPU device —
@@ -95,6 +97,8 @@ func NewManager(cfg config.Config, factory engine.Factory, log *slog.Logger) *Ma
 		entries:     make(map[string]*entry, len(cfg.Models)),
 		warm:        make(map[string]bool, len(cfg.Models)),
 		preloadErrs: make(map[string]string),
+		preloadAt:   make(map[string]time.Time),
+		preloadMax:  time.Duration(cfg.PreloadTimeoutSec) * time.Second,
 		sem:         make(chan struct{}, cfg.MaxConcurrent),
 		stopCh:      make(chan struct{}),
 	}
@@ -449,11 +453,13 @@ func (m *Manager) effectiveWindow(id string, info engine.ModelInfo) int {
 //
 // The concurrency slot (sem) and the per-entry lock are released by the deferred
 // calls above/below. This is safe even when the engine overruns: the manager's
-// own per-request watchdog owns the inactivity bound (the native engine's
-// no-token guard is a backstop), and the native engine bounds each generation
-// call with the hard timeout, then waits for the (cooperatively aborted) engine
-// call to unwind before returning, so the model lock is never released while
-// engine code is still running.
+// own per-request watchdog is the inactivity guard (the native engine's
+// no-token check cannot fire while the engine is polling the abort predicate —
+// each poll refreshes the clock before the expiry check — and is no fallback
+// when the watchdog is disabled). The native engine bounds each generation call
+// with the hard timeout, then waits for the (cooperatively aborted) engine call
+// to unwind before returning, so the model lock is never released while engine
+// code is still running.
 func (m *Manager) Generate(ctx context.Context, id string, req engine.GenerateRequest, onToken engine.TokenFunc) (engine.Usage, error) {
 	if err := m.acquireSem(ctx); err != nil {
 		return engine.Usage{}, err
@@ -534,7 +540,9 @@ func (m *Manager) Generate(ctx context.Context, id string, req engine.GenerateRe
 		}
 	}()
 	usage, err := lease.Model().Generate(ctx, req, onToken)
-	if tripped.Load() {
+	// The watchdog only owns the "no output" outcome: do not mask a genuine
+	// engine error that happened to coincide with a tripped timer.
+	if tripped.Load() && (err == nil || errors.Is(err, engine.ErrContextCanceled)) {
 		return usage, engine.ErrNoToken
 	}
 	return usage, err

@@ -120,8 +120,9 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// One request context bounds the whole request: the prompt-window
-	// preflight, any model load, and generation (including streaming).
+	// One request context bounds request handling, the prompt-window preflight
+	// and generation (including streaming). Cancellation is cooperative: a
+	// native model load is a blocking C call that does not honor it.
 	ctx, cancel := s.requestContext(r)
 	defer cancel()
 

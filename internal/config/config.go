@@ -100,8 +100,10 @@ func Default() Config {
 		// wait for a model, not how many run; set it explicitly to change the
 		// queue depth.
 		MaxConcurrent: 0,
-		// Warm-up is opt-in; the budget bounds one model's load so a broken or
-		// huge model cannot leave readiness stuck in "loading" forever.
+		// Warm-up is opt-in. The budget is cooperative and reporting-only: a
+		// native load is a blocking C call that cannot be canceled, but readiness
+		// still reports the budget expiry as an error instead of staying "loading"
+		// forever.
 		Preload:           false,
 		PreloadTimeoutSec: 300,
 		LogLevel:          "info",
@@ -174,12 +176,34 @@ var configKeyTags = func() map[string]string {
 	return tags
 }()
 
+// configSliceTags is the set of canonical Config JSON tags whose field is a
+// slice. Load treats an explicit JSON null differently for these: a null scalar
+// keeps the default, while a null list clears the list (nil), matching the
+// pre-branch behavior that a config without CORS origins or models relied on.
+var configSliceTags = func() map[string]bool {
+	t := reflect.TypeOf(Config{})
+	tags := make(map[string]bool)
+	for i := 0; i < t.NumField(); i++ {
+		if t.Field(i).Type.Kind() != reflect.Slice {
+			continue
+		}
+		tag := strings.Split(t.Field(i).Tag.Get("json"), ",")[0]
+		if tag == "" || tag == "-" {
+			continue
+		}
+		tags[tag] = true
+	}
+	return tags
+}()
+
 // Load reads a JSON config file and overlays it on the defaults. A missing
 // path is not an error (defaults are returned unchanged). An explicit JSON
-// null for a key keeps that field's default. A "models" key present in the
-// file (in any case) replaces the built-in registry exactly, with zero-value
-// fields for anything the file omits; a file without a "models" key keeps the
-// built-in list.
+// null keeps the default for a scalar field but clears a list field (api_keys,
+// allowed_origins, preload_models, models) to nil, preserving pre-branch
+// behavior: null means "no CORS origins" and "no models", not the defaults.
+// A "models" key present in the file (in any case) replaces the built-in
+// registry exactly, with zero-value fields for anything the file omits; a file
+// without a "models" key keeps the built-in list.
 func Load(path string) (Config, error) {
 	cfg := Default()
 	if path == "" {
@@ -198,13 +222,14 @@ func Load(path string) (Config, error) {
 		return cfg, fmt.Errorf("parse config %q: %w", path, err)
 	}
 	// Resolve the file's top-level keys against the Config JSON tags so
-	// "Models", "MODELS" and "models" behave identically, and drop null values
-	// so an explicit null keeps the default (the decoder would otherwise zero
-	// non-pointer fields, unlike a no-op overlay). Unknown keys are left as-is
-	// (the decoder ignores them). Keys are processed in sorted order: when the
-	// exact canonical spelling is present it wins, otherwise the
-	// lexicographically smallest case variant wins, so duplicate variants never
-	// race on map iteration order.
+	// "Models", "MODELS" and "models" behave identically. An explicit null is
+	// dropped for scalar fields so it keeps the default (the decoder would
+	// otherwise zero non-pointer fields, unlike a no-op overlay); for a slice
+	// field the null is kept so the fresh-zero decode nils the list. Unknown
+	// keys are left as-is (the decoder ignores them). Keys are processed in
+	// sorted order: when the exact canonical spelling is present it wins,
+	// otherwise the lexicographically smallest case variant wins, so duplicate
+	// variants never race on map iteration order.
 	keys := make([]string, 0, len(raw))
 	for k := range raw {
 		keys = append(keys, k)
@@ -213,10 +238,10 @@ func Load(path string) (Config, error) {
 	normalized := make(map[string]json.RawMessage, len(raw))
 	for _, k := range keys {
 		v := raw[k]
-		if strings.TrimSpace(string(v)) == "null" {
+		tag, known := configKeyTags[strings.ToLower(k)]
+		if known && strings.TrimSpace(string(v)) == "null" && !configSliceTags[tag] {
 			continue
 		}
-		tag, known := configKeyTags[strings.ToLower(k)]
 		if !known {
 			normalized[k] = v
 			continue
@@ -417,7 +442,9 @@ func (c Config) HardRequestTimeout() time.Duration {
 // is true, else no targets (the default lazy-load behavior).
 func (c Config) PreloadIDs() []string {
 	if len(c.PreloadModels) > 0 {
-		return c.PreloadModels
+		// Return a copy: callers (notably readiness) must not be able to mutate
+		// the resolved configuration.
+		return append([]string(nil), c.PreloadModels...)
 	}
 	if c.Preload && len(c.Models) == 1 {
 		return []string{c.Models[0].ID}
@@ -446,10 +473,10 @@ func (c *Config) ApplyModelFlags(model, modelID string, ctx int) error {
 		return fmt.Errorf("resolve --model %q: %w", model, err)
 	}
 	base := modelFileStem(filepath.Base(abs))
-	if base == "" {
-		return fmt.Errorf("--model: cannot derive a model id from %q; pass --model-id", model)
-	}
 	if modelID == "" {
+		// The stem-derived id is the default; an explicit --model-id may
+		// legitimately rescue a path whose stem carries no usable identity
+		// (for example ".gguf", whose stem is empty).
 		modelID = slugify(base)
 	}
 	if modelID == "" {

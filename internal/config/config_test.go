@@ -122,13 +122,13 @@ func TestLoadReplacesModels(t *testing.T) {
 	}
 }
 
-// TestLoadNullValuesKeepDefaults verifies that an explicit JSON null for a
-// top-level key keeps that field's default instead of zeroing it, so an
+// TestLoadNullScalarsKeepDefaults verifies that an explicit JSON null for a
+// scalar top-level key keeps that field's default instead of zeroing it, so an
 // existing config.json that uses null keeps starting and behaving as before.
-func TestLoadNullValuesKeepDefaults(t *testing.T) {
+func TestLoadNullScalarsKeepDefaults(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "cfg.json")
-	body := `{"listen":null,"allowed_origins":null,"tool_calling":null,"max_seq_len":null,"models":null}`
+	body := `{"listen":null,"tool_calling":null,"max_seq_len":null}`
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -146,21 +146,60 @@ func TestLoadNullValuesKeepDefaults(t *testing.T) {
 	if cfg.MaxSeqLen != def.MaxSeqLen {
 		t.Fatalf("max_seq_len = %d, want default %d", cfg.MaxSeqLen, def.MaxSeqLen)
 	}
-	if len(cfg.AllowedOrigins) != len(def.AllowedOrigins) {
-		t.Fatalf("allowed_origins = %v, want default %v", cfg.AllowedOrigins, def.AllowedOrigins)
+}
+
+// TestLoadNullListsClearLists verifies the pre-branch null semantics for list
+// fields: an explicit null clears the list to nil instead of restoring the
+// default. This matters most for allowed_origins (null previously meant "no
+// CORS origins", not the permissive ["*"]) and models (null meant zero models,
+// not the built-in registry).
+func TestLoadNullListsClearLists(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cfg.json")
+	body := `{"allowed_origins":null,"models":null,"api_keys":null,"preload_models":null}`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	for i := range def.AllowedOrigins {
-		if cfg.AllowedOrigins[i] != def.AllowedOrigins[i] {
-			t.Fatalf("allowed_origins = %v, want default %v", cfg.AllowedOrigins, def.AllowedOrigins)
-		}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
 	}
+	if cfg.AllowedOrigins != nil {
+		t.Fatalf("allowed_origins = %v, want nil (an explicit null clears the list)", cfg.AllowedOrigins)
+	}
+	if cfg.Models != nil {
+		t.Fatalf("models = %+v, want nil (an explicit null clears the list)", cfg.Models)
+	}
+	if len(cfg.Models) != 0 {
+		t.Fatalf("len(models) = %d, want 0", len(cfg.Models))
+	}
+	if cfg.APIKeys != nil {
+		t.Fatalf("api_keys = %v, want nil", cfg.APIKeys)
+	}
+	if cfg.PreloadModels != nil {
+		t.Fatalf("preload_models = %v, want nil", cfg.PreloadModels)
+	}
+}
+
+// TestLoadAbsentListsKeepBuiltins verifies the other half of the null rule: a
+// config that does not mention the list keys keeps the built-in defaults,
+// including the default registry and the permissive CORS origin.
+func TestLoadAbsentListsKeepBuiltins(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cfg.json")
+	if err := os.WriteFile(path, []byte(`{"listen":"127.0.0.1:9999"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	def := Default()
 	if len(cfg.Models) != len(def.Models) {
-		t.Fatalf("len(models) = %d, want default %d", len(cfg.Models), len(def.Models))
+		t.Fatalf("len(models) = %d, want the built-in %d", len(cfg.Models), len(def.Models))
 	}
-	for i := range def.Models {
-		if cfg.Models[i].ID != def.Models[i].ID {
-			t.Fatalf("models[%d].id = %q, want default %q", i, cfg.Models[i].ID, def.Models[i].ID)
-		}
+	if len(cfg.AllowedOrigins) != 1 || cfg.AllowedOrigins[0] != "*" {
+		t.Fatalf("allowed_origins = %v, want the default [*]", cfg.AllowedOrigins)
 	}
 }
 
@@ -359,6 +398,33 @@ func TestApplyModelFlagsExplicitID(t *testing.T) {
 	}
 	if m.ContextLength != 4096 {
 		t.Fatalf("context_length = %d, want 4096", m.ContextLength)
+	}
+}
+
+// TestApplyModelFlagsExplicitIDRescuesEmptyStem verifies that an explicit
+// --model-id wins when the file stem yields no id (a bare ".gguf"): only when
+// BOTH the stem-derived id and --model-id are empty is that an error. Name may
+// legitimately be empty in this case.
+func TestApplyModelFlagsExplicitIDRescuesEmptyStem(t *testing.T) {
+	cfg := Default()
+	if err := cfg.ApplyModelFlags("/data/models/.gguf", "solo", 0); err != nil {
+		t.Fatalf("ApplyModelFlags(.gguf, solo) = %v, want nil (explicit id)", err)
+	}
+	if len(cfg.Models) != 1 {
+		t.Fatalf("len(models) = %d, want 1: %+v", len(cfg.Models), cfg.Models)
+	}
+	m := cfg.Models[0]
+	if m.ID != "solo" {
+		t.Fatalf("id = %q, want %q", m.ID, "solo")
+	}
+	if m.Name != "" {
+		t.Fatalf("name = %q, want empty (no stem to derive it from)", m.Name)
+	}
+	if m.File != "/data/models/.gguf" {
+		t.Fatalf("file = %q, want the absolute path unchanged", m.File)
+	}
+	if m.ContextLength != 0 {
+		t.Fatalf("context_length = %d, want 0", m.ContextLength)
 	}
 }
 
@@ -630,8 +696,14 @@ func TestPreloadIDs(t *testing.T) {
 	// An explicit list wins over preload:true and may name several models.
 	cfg.Models = []RegistryModel{{ID: "a"}, {ID: "b"}}
 	cfg.PreloadModels = []string{"b", "a"}
-	if got := cfg.PreloadIDs(); len(got) != 2 || got[0] != "b" || got[1] != "a" {
+	got := cfg.PreloadIDs()
+	if len(got) != 2 || got[0] != "b" || got[1] != "a" {
 		t.Fatalf("PreloadIDs() with an explicit list = %v, want [b a]", got)
+	}
+	// PreloadIDs returns a copy, not the config's backing slice.
+	got[0] = "mutated"
+	if cfg.PreloadModels[0] != "b" {
+		t.Fatalf("PreloadIDs() aliases preload_models: got %v after mutating the result", cfg.PreloadModels)
 	}
 
 	// An empty list falls back to the preload selectors; with preload off there

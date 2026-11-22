@@ -190,6 +190,11 @@ traffic only once it returns `200`:
 {"status":"ready","models":[{"id":"qwen3.6-35b-a3b","loaded":true}]}
 ```
 
+`preload_timeout_sec` is cooperative and reporting-only: a native model load is
+a blocking C call that cannot be canceled, so a budget expiry is reported as
+`503 error` even while the load may still be unwinding (and flips to `ready`
+once it finishes).
+
 Readiness is sticky on success: a later idle eviction does not flip a warmed
 process back to `503`. A failed warm-up stays reported until that model loads
 successfully — a lazy request that loads it clears the error. Both probes are
@@ -304,6 +309,8 @@ pre-formatted prompt.
 - The idle loop unloads models idle longer than `idle_timeout_sec`.
 - With `max_loaded_models = N`, the manager guarantees at most `N` resident
   models by evicting the least-recently-used idle one when loading another.
+  Models beyond `max_loaded_models` cannot stay warm: preloading more targets
+  than that re-evicts the earlier ones.
 
 ## Configuration
 
@@ -493,15 +500,17 @@ served registry.
 - `max_prompt_tokens` caps `max_tokens`: a request asking for more is clamped to
   this ceiling (not rejected), so OpenAI-compatible clients that request large
   output budgets — e.g. Roo Code, which clamps to 20% of the model's declared
-  context window — still succeed. `request_timeout_sec` bounds every generation
-  and cancels it on client disconnect. `no_token_timeout_sec` (default `0`,
-  disabled) guards against a hung engine: it aborts when neither a token nor a
+  context window — still succeed. `request_timeout_sec` bounds request handling,
+  the prompt-window preflight and generation, and cancels generation on client
+  disconnect. Cancellation is cooperative: a native model load is a blocking C
+  call that does not honor it. `no_token_timeout_sec` (default `0`, disabled)
+  guards against a hung engine: it aborts when neither a token nor a
   prefill-progress event arrives within the window, so a long prefill is not
   mistaken for a hang. `hard_timeout_sec` bounds one generation call and its
   abort is cooperative: an engine that stops polling the abort predicate cannot
   be abandoned. Even with the no-token guard disabled, `request_timeout_sec`
-  bounds the whole request, including the prompt-window preflight and any model
-  load.
+  bounds request handling and generation; the model load itself remains
+  cooperative and is not cancellable.
 - Cancellation is cooperative across the C ABI: an abort predicate is polled
   inside the engine's per-layer / per-block loop, not only at the token
   callback, so a stuck prefill can be interrupted. Timeouts and cancellation are
