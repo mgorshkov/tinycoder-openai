@@ -362,6 +362,142 @@ func TestApplyModelFlagsExplicitID(t *testing.T) {
 	}
 }
 
+// TestApplyModelFlagsDerivesIDFromStem verifies that only a .gguf extension is
+// stripped from the file base name. Dotted names that are not a .gguf file (an
+// EXL3 checkpoint directory such as qwen3.8-27B-exl3-1.60bpw, or a plain dotted
+// stem) keep their full name: trimming any dot-suffix would silently drop the
+// quantization/bit width and advertise the wrong identity. The .gguf suffix is
+// matched case-insensitively.
+func TestApplyModelFlagsDerivesIDFromStem(t *testing.T) {
+	tests := []struct {
+		name     string
+		path     string
+		wantName string
+		wantID   string
+	}{
+		{
+			name:     "dotted EXL3 checkpoint directory",
+			path:     "/data/models/qwen3.8-27B-exl3-1.60bpw",
+			wantName: "qwen3.8-27B-exl3-1.60bpw",
+			wantID:   "qwen3.8-27b-exl3-1.60bpw",
+		},
+		{
+			name:     "dotted extensionless stem",
+			path:     "/data/models/qwen2.5-coder",
+			wantName: "qwen2.5-coder",
+			wantID:   "qwen2.5-coder",
+		},
+		{
+			name:     "dotted gguf name",
+			path:     "/data/models/qwen3.8-27B-Q4_K_M.gguf",
+			wantName: "qwen3.8-27B-Q4_K_M",
+			wantID:   "qwen3.8-27b-q4-k-m",
+		},
+		{
+			name:     "uppercase GGUF suffix",
+			path:     "/data/models/Model-UPPER.GGUF",
+			wantName: "Model-UPPER",
+			wantID:   "model-upper",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Default()
+			if err := cfg.ApplyModelFlags(tc.path, "", 0); err != nil {
+				t.Fatal(err)
+			}
+			if len(cfg.Models) != 1 {
+				t.Fatalf("len(models) = %d, want 1: %+v", len(cfg.Models), cfg.Models)
+			}
+			m := cfg.Models[0]
+			if m.Name != tc.wantName {
+				t.Fatalf("name = %q, want %q (only a .gguf suffix may be stripped)", m.Name, tc.wantName)
+			}
+			if m.ID != tc.wantID {
+				t.Fatalf("derived id = %q, want %q", m.ID, tc.wantID)
+			}
+			if m.File != tc.path {
+				t.Fatalf("file = %q, want the absolute path unchanged", m.File)
+			}
+		})
+	}
+}
+
+// TestApplyModelFlagsEmptyDerivedID verifies that a path from which no model
+// identity can be derived (a bare ".gguf" or a stem that slugifies to nothing)
+// fails in ApplyModelFlags with an actionable message instead of surfacing the
+// later generic "empty id" validation error.
+func TestApplyModelFlagsEmptyDerivedID(t *testing.T) {
+	for _, path := range []string{"/data/models/.gguf", "/data/models/---.gguf"} {
+		cfg := Default()
+		before := len(cfg.Models)
+		err := cfg.ApplyModelFlags(path, "", 0)
+		if err == nil {
+			t.Fatalf("ApplyModelFlags(%q) = nil, want a cannot-derive-id error", path)
+		}
+		if !strings.Contains(err.Error(), "--model: cannot derive a model id from") {
+			t.Fatalf("error = %q, want an actionable cannot-derive-id message", err)
+		}
+		if !strings.Contains(err.Error(), "pass --model-id") {
+			t.Fatalf("error = %q, want it to suggest --model-id", err)
+		}
+		if len(cfg.Models) != before {
+			t.Fatalf("a failed call changed the registry: len = %d, want %d", len(cfg.Models), before)
+		}
+	}
+}
+
+// TestApplyModelFlagsPreloadInteraction verifies the documented interaction with
+// preload: because --model replaces the registry, a preload_models entry naming
+// a config-file id still fails loudly (an explicit config is never silently
+// dropped), while preload:true follows the single flag-provided model.
+func TestApplyModelFlagsPreloadInteraction(t *testing.T) {
+	t.Run("stale preload_models fail loudly", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "cfg.json")
+		body := `{"models":[{"id":"from-file","name":"From File","file":"from-file.gguf"}],` +
+			`"preload_models":["from-file"]}`
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := cfg.ApplyModelFlags("/models/solo.gguf", "solo", 0); err != nil {
+			t.Fatal(err)
+		}
+		err = cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), `preload_models: unknown model id "from-file"`) {
+			t.Fatalf("Validate() = %v, want a loud unknown preload model id error", err)
+		}
+	})
+
+	t.Run("preload true follows the single flag model", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "cfg.json")
+		body := `{"preload":true,"models":[` +
+			`{"id":"alpha","name":"Alpha","file":"alpha.gguf"},` +
+			`{"id":"beta","name":"Beta","file":"beta.gguf"}]}`
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := cfg.ApplyModelFlags("/models/solo.gguf", "solo", 4096); err != nil {
+			t.Fatal(err)
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate() = %v, want nil: preload must follow the single flag model", err)
+		}
+		if got := cfg.PreloadIDs(); len(got) != 1 || got[0] != "solo" {
+			t.Fatalf("PreloadIDs() = %v, want [solo]", got)
+		}
+	})
+}
+
 // TestApplyModelFlagsRelativePathMadeAbsolute verifies that a relative --model
 // is resolved against the process working directory (filepath.Abs), never
 // against models_dir.

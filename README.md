@@ -323,7 +323,7 @@ Precedence: **flags > environment > JSON file > built-in defaults**.
 | `--models-dir` | `TINYCODER_MODELS_DIR` | `/data/models` | GGUF root |
 | `--log-level` | `TINYCODER_LOG_LEVEL` | `info` | `debug`/`info`/`warn`/`error` |
 | `--model` | — | — | Serve exactly this model, replacing the config `models` registry |
-| `--model-id` | — | file base name | Served id for `--model` |
+| `--model-id` | — | slugified base name of the file without a `.gguf` extension | Served id for `--model` |
 | `--ctx` | — | `0` (engine default) | Context length for `--model` |
 
 For one-model-per-process operation (like `llama-server`) the binary can serve
@@ -337,10 +337,16 @@ a single model without a config-file registry:
 
 `--model` replaces the config file's `models` registry (the flags win over the
 file), so exactly that one model is served and no field is inherited from the
-file's first entry. `--model-id` defaults to the slugified file base name
-without its extension, a relative `--model` is resolved against the process
+file's first entry. `--model-id` defaults to the slugified base name of the file
+without a `.gguf` extension (other dotted suffixes are part of the name, e.g. an
+EXL3 checkpoint directory), a relative `--model` is resolved against the process
 working directory (not `models_dir`), and `--ctx 0` uses the engine's context
 length. `--model-id` or `--ctx` without `--model` is a startup error.
+
+Because `--model` replaces the registry, any `preload_models` from the config
+file or `TINYCODER_PRELOAD_MODELS` must name the flag-provided id or be cleared;
+otherwise startup fails with `preload_models: unknown model id`. `preload: true`
+follows the single flag-provided model.
 
 Other environment variables: `TINYCODER_MAX_LOADED_MODELS`,
 `TINYCODER_IDLE_TIMEOUT_SEC`, `TINYCODER_THREADS`, `TINYCODER_MAX_SEQ_LEN`,
