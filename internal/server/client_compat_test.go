@@ -2,7 +2,6 @@ package server
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -290,34 +289,23 @@ func TestMaxTokensCeilingAppliesToCompletions(t *testing.T) {
 	}
 }
 
-// slowLoadEngine blocks in Load until released, simulating a cold, large GGUF
-// load on a shared GPU that takes a long time before the first token.
-type slowLoadEngine struct {
-	*engine.Stub
-	release chan struct{}
-}
-
-func (e *slowLoadEngine) Load(ctx context.Context, opts engine.LoadOptions) error {
-	select {
-	case <-e.release:
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-	return e.Stub.Load(ctx, opts)
-}
-
-// TestChatStreamsRoleChunkBeforeModelLoad verifies that a streaming chat request
-// emits the opening assistant-role chunk immediately, before the (potentially
-// very slow) model load completes. A client that waits for the first SSE *data*
-// event therefore gets an acknowledgement instead of pure silence / keep-alive
-// comments while the model loads.
-func TestChatStreamsRoleChunkBeforeModelLoad(t *testing.T) {
+// TestChatStreamsRoleChunkBeforeGeneration verifies that a streaming chat
+// request emits the opening assistant-role chunk immediately, before the
+// (potentially very slow) generation/prefill begins. A client that waits for
+// the first SSE data event therefore gets an acknowledgement instead of pure
+// silence until the first token.
+//
+// The prompt-window preflight deliberately runs before any stream headers and
+// loads a cold model first (see Server.checkContextWindow), so this test blocks
+// in Generate rather than in Load: the role chunk is still emitted before the
+// first token, which is the latency a client actually waits on while prefilling.
+func TestChatStreamsRoleChunkBeforeGeneration(t *testing.T) {
 	cfg := testConfig()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	release := make(chan struct{})
 	mgr := NewManager(cfg, func(id string) engine.Engine {
-		return &slowLoadEngine{Stub: engine.NewStub(id), release: release}
+		return &blockingEngine{Stub: engine.NewStub(id), release: release}
 	}, log)
 	ts := httptest.NewServer(New(cfg, mgr, log).Handler())
 	t.Cleanup(ts.Close)

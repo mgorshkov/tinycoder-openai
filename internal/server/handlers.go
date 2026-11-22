@@ -151,6 +151,14 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, chatRe
 		return
 	}
 
+	// Reject a prompt that cannot fit the model's window before opening any
+	// stream: the engine refuses it by returning zero tokens without an error,
+	// which would otherwise surface as an empty, successful completion.
+	if err := s.checkContextWindow(r, modelID, genReq); err != nil {
+		s.writeGenerateError(w, err)
+		return
+	}
+
 	includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
 	if req.Stream {
 		if isChat {
@@ -325,6 +333,27 @@ func (s *Server) buildRequest(req generationRequest, chatRequired bool, toolInst
 	return out, modelID, nil
 }
 
+// checkContextWindow is the shared prompt-window preflight for every generation
+// endpoint. It runs before any stream headers are written, so an oversized
+// prompt is a clean 400 rather than an empty SSE stream.
+//
+// It is best-effort: a failure to determine the prompt size (tokenizer
+// unavailable, model load error) returns nil, leaving generation to surface the
+// error as it did before.
+func (s *Server) checkContextWindow(r *http.Request, modelID string, genReq engine.GenerateRequest) error {
+	ctx, cancel := s.requestContext(r)
+	defer cancel()
+
+	tokens, window, err := s.mgr.PromptTokens(ctx, modelID, genReq)
+	if err != nil {
+		return nil
+	}
+	if window > 0 && tokens > window {
+		return fmt.Errorf("%w: prompt is too long: %d tokens > %d maximum", engine.ErrContextLength, tokens, window)
+	}
+	return nil
+}
+
 // writeGenerateError maps a generation failure to a non-200 HTTP response.
 //
 // Every branch below writes a status >= 400: cancellation, deadline expiry and
@@ -336,6 +365,10 @@ func (s *Server) writeGenerateError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, err.Error(), "invalid_request_error", "model_not_found")
 	case errors.Is(err, ErrCapacity):
 		writeError(w, http.StatusServiceUnavailable, err.Error(), "server_error", "capacity")
+	case errors.Is(err, engine.ErrContextLength):
+		// The prompt does not fit the model's window (the preflight normally
+		// catches this; this also maps an engine-side refusal).
+		writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "context_length_exceeded")
 	case errors.Is(err, engine.ErrNoToken):
 		// The engine produced no token within the guard window: report 504
 		// rather than hanging the request indefinitely.
@@ -632,7 +665,11 @@ func (s *sseWriter) writeDone() {
 // simply ignore the event, and the subsequent [DONE] terminates the stream.
 func (s *sseWriter) writeError(err error) {
 	typ := errorTypeFor(err)
-	s.write(errorBody{Error: errorDetail{Message: "generation failed: " + err.Error(), Type: typ}})
+	code := ""
+	if errors.Is(err, engine.ErrContextLength) {
+		code = "context_length_exceeded"
+	}
+	s.write(errorBody{Error: errorDetail{Message: "generation failed: " + err.Error(), Type: typ, Code: code}})
 }
 
 // startHeartbeat launches a goroutine that emits a keep-alive comment every

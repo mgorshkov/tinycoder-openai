@@ -77,6 +77,11 @@ int tc_engine_set_threads(tc_engine_t engine, int n_threads);
  * Returns 0 on success. */
 int tc_engine_clear_kv(tc_engine_t engine);
 
+/* Returns 1 when the last generate refused the prompt because it did not fit
+ * the model's context window; the flag is reset at the start of each generate.
+ * Returns 0 for a null handle. */
+int tc_engine_context_full(tc_engine_t engine);
+
 /* Run generation. Prompt is the fully rendered prompt string.
  * `abort_cb` (may be NULL) is polled inside the per-layer loop.
  * Returns the number of generated tokens (>=0) on success, or -1 on error AND

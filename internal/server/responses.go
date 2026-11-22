@@ -119,6 +119,12 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Reject an oversized prompt before opening a stream or generating.
+	if err := s.checkContextWindow(r, modelID, genReq); err != nil {
+		writeResponsesRequestError(w, err)
+		return
+	}
+
 	if req.Stream {
 		s.streamResponses(w, r, modelID, genReq)
 		return
@@ -168,6 +174,10 @@ func (s *Server) generateText(r *http.Request, modelID string, genReq engine.Gen
 func writeResponsesRequestError(w http.ResponseWriter, err error) {
 	if errors.Is(err, ErrModelNotFound) {
 		writeError(w, http.StatusNotFound, err.Error(), "invalid_request_error", "model_not_found")
+		return
+	}
+	if errors.Is(err, engine.ErrContextLength) {
+		writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "context_length_exceeded")
 		return
 	}
 	writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "")
