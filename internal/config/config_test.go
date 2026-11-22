@@ -110,6 +110,81 @@ func TestLoadReplacesModels(t *testing.T) {
 		t.Fatalf("file-omitted fields leaked from the built-in registry: architecture=%q quantization=%q description=%q",
 			m.Architecture, m.Quantization, m.Description)
 	}
+	// Every other default must survive the fresh-zero decode.
+	def := Default()
+	if cfg.Listen != def.Listen {
+		t.Fatalf("listen = %q, want default %q", cfg.Listen, def.Listen)
+	}
+	if cfg.DefaultMaxTokens != def.DefaultMaxTokens {
+		t.Fatalf("default_max_tokens = %d, want default %d",
+			cfg.DefaultMaxTokens, def.DefaultMaxTokens)
+	}
+}
+
+// TestLoadNullValuesKeepDefaults verifies that an explicit JSON null for a
+// top-level key keeps that field's default instead of zeroing it, so an
+// existing config.json that uses null keeps starting and behaving as before.
+func TestLoadNullValuesKeepDefaults(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cfg.json")
+	body := `{"listen":null,"allowed_origins":null,"tool_calling":null,"max_seq_len":null,"models":null}`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	def := Default()
+	if cfg.Listen != def.Listen {
+		t.Fatalf("listen = %q, want default %q", cfg.Listen, def.Listen)
+	}
+	if cfg.ToolCalling != def.ToolCalling {
+		t.Fatalf("tool_calling = %v, want default %v", cfg.ToolCalling, def.ToolCalling)
+	}
+	if cfg.MaxSeqLen != def.MaxSeqLen {
+		t.Fatalf("max_seq_len = %d, want default %d", cfg.MaxSeqLen, def.MaxSeqLen)
+	}
+	if len(cfg.AllowedOrigins) != len(def.AllowedOrigins) {
+		t.Fatalf("allowed_origins = %v, want default %v", cfg.AllowedOrigins, def.AllowedOrigins)
+	}
+	for i := range def.AllowedOrigins {
+		if cfg.AllowedOrigins[i] != def.AllowedOrigins[i] {
+			t.Fatalf("allowed_origins = %v, want default %v", cfg.AllowedOrigins, def.AllowedOrigins)
+		}
+	}
+	if len(cfg.Models) != len(def.Models) {
+		t.Fatalf("len(models) = %d, want default %d", len(cfg.Models), len(def.Models))
+	}
+	for i := range def.Models {
+		if cfg.Models[i].ID != def.Models[i].ID {
+			t.Fatalf("models[%d].id = %q, want default %q", i, cfg.Models[i].ID, def.Models[i].ID)
+		}
+	}
+}
+
+// TestLoadDuplicateCaseVariantKeysDeterministic verifies that a file containing
+// several case variants of one top-level key resolves deterministically: the
+// exact canonical spelling ("models") wins, not whichever key Go's map
+// iteration happens to visit last.
+func TestLoadDuplicateCaseVariantKeysDeterministic(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cfg.json")
+	body := `{"models":[{"id":"canonical","name":"Canonical","file":"canonical.gguf"}],` +
+		`"Models":[{"id":"variant","name":"Variant","file":"variant.gguf"}]}`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 50; i++ {
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(cfg.Models) != 1 || cfg.Models[0].ID != "canonical" {
+			t.Fatalf("iteration %d: models = %+v, want exactly the canonical \"models\" entry",
+				i, cfg.Models)
+		}
+	}
 }
 
 // TestLoadEmptyModelsServesNone verifies an explicit empty list serves no
