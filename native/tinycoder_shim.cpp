@@ -290,13 +290,6 @@ int tc_engine_clear_kv(tc_engine_t engine) {
     }
 }
 
-int tc_engine_context_full(tc_engine_t engine) {
-    if (engine == nullptr) {
-        return 0;
-    }
-    return static_cast<tinycoder::Model *>(engine)->contextFull() ? 1 : 0;
-}
-
 int tc_engine_generate(tc_engine_t engine, const char *prompt, int max_tokens,
                        float temperature, float top_p, float top_k,
                        float repeat_penalty, int repeat_last_n, uint32_t seed,

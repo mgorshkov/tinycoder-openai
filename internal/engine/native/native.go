@@ -198,16 +198,6 @@ func (e *Engine) CountPromptTokens(req engine.GenerateRequest) (int, error) {
 	return n, nil
 }
 
-// contextFull reports whether the last generate refused the prompt because it
-// did not fit the model's context window. The engine resets the flag at the
-// start of every generate, so it is only meaningful after a call has returned.
-func (e *Engine) contextFull() bool {
-	if e.handle == nil {
-		return false
-	}
-	return C.tc_engine_context_full(e.handle) != 0
-}
-
 // Generate runs the model and streams tokens through req-specific callback.
 //
 // The C++ engine runs on its own OS thread (cgo.LockOSThread). If the caller's
@@ -307,10 +297,12 @@ func (e *Engine) Generate(ctx context.Context, req engine.GenerateRequest, onTok
 			return usage, engine.ErrContextCanceled
 		case gc.noToken.Load():
 			return usage, engine.ErrNoToken
-		case generated == 0 && e.contextFull():
+		case generated == 0 && e.info.ContextLength > 0 && usage.PromptTokens > int(e.info.ContextLength):
 			// The engine refuses an oversized prompt without an error: forward()
-			// returns nothing and model->generate reports zero tokens. Surface it
-			// as ErrContextLength instead of an empty success.
+			// returns nothing and model->generate reports zero tokens. Detect it
+			// from the request itself (the engine-level signal is not reliable for
+			// the full-GPU path) and surface ErrContextLength instead of an empty
+			// success.
 			return usage, fmt.Errorf("%w: prompt is too long: %d tokens > %d maximum",
 				engine.ErrContextLength, usage.PromptTokens, int(e.info.ContextLength))
 		default:

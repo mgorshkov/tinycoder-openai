@@ -131,8 +131,9 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Reject an oversized prompt before opening a stream or generating. The
-	// Anthropic error shape carries a type and message, but no code.
-	if err := s.checkContextWindow(r, modelID, genReq); err != nil {
+	// streaming check only runs for a warm model (R1); the Anthropic error shape
+	// carries a type and message, but no code.
+	if err := s.checkContextWindow(r, modelID, genReq, req.Stream); err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
@@ -181,6 +182,10 @@ func (s *Server) writeMessagesError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, ErrModelNotFound):
 		writeAnthropicError(w, http.StatusNotFound, "not_found_error", err.Error())
+	case errors.Is(err, engine.ErrContextLength):
+		// The prompt does not fit the model's window (the preflight normally
+		// catches this; this also maps an engine-side refusal).
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 	case errors.Is(err, ErrCapacity):
 		writeAnthropicError(w, http.StatusServiceUnavailable, "overloaded_error", err.Error())
 	case errors.Is(err, engine.ErrNoToken):
@@ -303,11 +308,15 @@ func (s *Server) streamMessages(w http.ResponseWriter, r *http.Request, modelID 
 	})
 	if genErr != nil {
 		// Anthropic terminates a failed stream with an error event; no
-		// message_stop follows.
+		// message_stop follows. A context-length refusal is a client error.
 		stopHB()
+		typ := "api_error"
+		if errors.Is(genErr, engine.ErrContextLength) {
+			typ = "invalid_request_error"
+		}
 		sw.writeEvent("error", anthropicErrorBody{
 			Type:  "error",
-			Error: anthropicErrorDetail{Type: "api_error", Message: "generation failed: " + genErr.Error()},
+			Error: anthropicErrorDetail{Type: typ, Message: "generation failed: " + genErr.Error()},
 		})
 		return
 	}

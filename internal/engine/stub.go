@@ -83,6 +83,15 @@ func (s *Stub) Generate(ctx context.Context, req GenerateRequest, onToken TokenF
 	if !s.loaded {
 		return Usage{}, ErrNotLoaded
 	}
+	// Mimic the native engine: a prompt that does not fit the window is refused
+	// with zero generated tokens and ErrContextLength, not an empty success.
+	if s.info.ContextLength > 0 {
+		if n, err := s.CountPromptTokens(req); err == nil && n > s.info.ContextLength {
+			usage := Usage{PromptTokens: n, TotalTokens: n}
+			return usage, fmt.Errorf("%w: prompt is too long: %d tokens > %d maximum",
+				ErrContextLength, n, s.info.ContextLength)
+		}
+	}
 	promptPreview := strings.TrimSpace(req.Prompt)
 	if len(req.Messages) > 0 {
 		promptPreview = strings.TrimSpace(req.Messages[len(req.Messages)-1].Content)
