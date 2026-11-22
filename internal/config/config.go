@@ -439,12 +439,23 @@ func (c Config) HardRequestTimeout() time.Duration {
 
 // PreloadIDs resolves the model ids the startup warm-up should load:
 // preload_models when non-empty, else the single registered model when preload
-// is true, else no targets (the default lazy-load behavior).
+// is true, else no targets (the default lazy-load behavior). Duplicate ids are
+// collapsed to their first occurrence so a model is warmed (and listed on
+// /readyz) at most once.
 func (c Config) PreloadIDs() []string {
 	if len(c.PreloadModels) > 0 {
-		// Return a copy: callers (notably readiness) must not be able to mutate
-		// the resolved configuration.
-		return append([]string(nil), c.PreloadModels...)
+		// Always return a copy: callers (notably readiness) must not be able to
+		// mutate the resolved configuration.
+		ids := make([]string, 0, len(c.PreloadModels))
+		seen := make(map[string]struct{}, len(c.PreloadModels))
+		for _, id := range c.PreloadModels {
+			if _, dup := seen[id]; dup {
+				continue
+			}
+			seen[id] = struct{}{}
+			ids = append(ids, id)
+		}
+		return ids
 	}
 	if c.Preload && len(c.Models) == 1 {
 		return []string{c.Models[0].ID}
@@ -456,8 +467,8 @@ func (c Config) PreloadIDs() []string {
 // resolves against the process working directory (like a shell path, not
 // against ModelsDir) and replaces the whole registry with that single entry;
 // --model-id overrides the id derived from the file name and --ctx sets the
-// entry's context window (0 means the engine default). --model-id and --ctx
-// without --model are errors.
+// entry's context window (0 inherits max_seq_len, the engine default). --model-id
+// and --ctx without --model are errors.
 func (c *Config) ApplyModelFlags(model, modelID string, ctx int) error {
 	if model == "" {
 		if modelID != "" || ctx != 0 {
@@ -467,6 +478,12 @@ func (c *Config) ApplyModelFlags(model, modelID string, ctx int) error {
 	}
 	if ctx < 0 {
 		return fmt.Errorf("--ctx must be >= 0")
+	}
+	// Resolve "engine default" up front: the manager treats a zero registry
+	// context_length as max_seq_len, and /v1/models must advertise the window
+	// that is actually used. An explicit --ctx N > 0 is unchanged.
+	if ctx == 0 {
+		ctx = c.MaxSeqLen
 	}
 	abs, err := filepath.Abs(model)
 	if err != nil {

@@ -736,8 +736,11 @@ func TestManagerPromptTokensFallsBackToRegistryWindow(t *testing.T) {
 	// engine metadata and must consult the registry.
 	warmModel(t, mgr)
 	mgr.mu.Lock()
-	mgr.entries["alpha"].info = engine.ModelInfo{}
+	e := mgr.entries["alpha"]
 	mgr.mu.Unlock()
+	e.mu.Lock()
+	e.info = engine.ModelInfo{}
+	e.mu.Unlock()
 
 	tokens, window, err := mgr.PromptTokens(context.Background(), "alpha", engine.GenerateRequest{Prompt: "hi"})
 	if err != nil {

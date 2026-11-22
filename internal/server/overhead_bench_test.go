@@ -8,9 +8,10 @@ package server
 //
 // They are opt-in and model-backed: set TINYCODER_BENCH_MODEL to a real local
 // GGUF and run `go test ./internal/server -bench 'Benchmark(EngineDirect|
-// GatewayStream|GatewayDelta|SSEWrite)$' -run '^$'`. Without the variable (and
-// always in a `tinycoder_stub` build, which has no real engine) every benchmark
-// skips, so the default `go test ./...` stays fast and model-free.
+// GatewayStream|GatewayDelta|GatewayHandler|SSEWrite)$' -run '^$'`. Without the
+// variable (and always in a `tinycoder_stub` build, which has no real engine)
+// every benchmark skips, so the default `go test ./...` stays fast and
+// model-free.
 //
 // Fairness controls:
 //   - The model is loaded ONCE per process and shared by both the direct and
@@ -41,7 +42,8 @@ package server
 //     so the bridge's per-token transition is inside BOTH numbers. The
 //     difference isolates the gateway/SSE layer, not the bridge.
 //   - BenchmarkGatewayDelta is a paired cross-check: it measures direct and
-//     gateway back-to-back for the same seed (alternating order), because GPU
+//     gateway in the same iteration for the same seed (alternating order; each
+//     call is preceded by an untimed one-token sampler reset), because GPU
 //     clock drift between two separate timed bursts is larger than the delta,
 //     and reports the per-pair ratio distribution.
 //   - BenchmarkGatewayHandler runs the same request through the handler with a

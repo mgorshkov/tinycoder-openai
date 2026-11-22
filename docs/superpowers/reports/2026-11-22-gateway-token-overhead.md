@@ -8,15 +8,17 @@ Qwen3.6-27B 33 → 20, Bonsai 69 → 57)?
 **Answer (load-bearing evidence): no. The gateway's own serialization work is
 2.6 µs per token — 0.011–0.047 % of engine token time across the measured models
 (0.047 % on the fastest) — and the handler with no socket or client adds no
-measurable time (Qwen +0.3 %, the others within ±2.5 % process noise). The CPU
-profile has no Go hotspot (99.4 % `runtime.cgocall`). No production code was
+measurable time (Qwen −0.3 % against the table's direct mean — 705.1 vs
+707.5 ms, so the sign is within process noise; the others within ±2.5 %). The
+CPU profile has no Go hotspot (99.4 % `runtime.cgocall`). No production code was
 changed.**
 
 **Supporting context:** the full end-to-end HTTP path — handler + loopback
 socket + in-process SSE consumer — costs more, and the fast model makes it
-visible: **+2.9 %** per token for Qwen2.5-Coder-1.5B in the paired measurement
-(per-count means 1.7–3.8 %, per-pair σ ≈ 5–6 %) and **+5.7–7.4 %** in sustained
-single-path runs; Ornith 9B **+0.8 %** paired; Bonsai 27B **+0.2 %** paired.
+visible: **+2.9 %** per-request time per token for Qwen2.5-Coder-1.5B in the
+paired measurement (per-count means 1.7–3.8 %, per-pair σ ≈ 5–6 %) and
+**+5.7–7.4 %** per-request time in sustained single-path runs (throughput
+−5.4 % to −6.9 %); Ornith 9B **+0.8 %** paired; Bonsai 27B **+0.2 %** paired.
 That is the right *direction* for "the faster the model, the larger the loss",
 but it is transport and client-consumption cost, not gateway/SSE serialization,
 and it is 3–7 % here, not 44 %. A smaller, transport-shaped effect exists; the
@@ -86,8 +88,11 @@ TINYCODER_BENCH_MODEL=/data/models/bonsai/Ternary-Bonsai-2-27B-PTQ1_0.gguf \
 
 `BenchmarkGatewayDelta` runs **one direct generation and one gateway request
 inside each benchmark iteration**, with the order alternating by iteration
-parity, so the pair is genuinely adjacent; it reports the per-pair ratio
-distribution. `BenchmarkGatewayHandler` runs the same request through
+parity. Each measured call is preceded by an untimed 1-token `resetSampler`
+generation, so the two members are adjacent apart from that reset (not literally
+back-to-back); both members still belong to one iteration, and the alternating
+order cancels GPU clock drift. It reports the per-pair ratio distribution.
+`BenchmarkGatewayHandler` runs the same request through
 `http.Handler.ServeHTTP` with an `httptest.ResponseRecorder` — no TCP and no
 HTTP client, `Flush` a no-op — isolating the handler's own work.
 
@@ -101,7 +106,9 @@ HTTP client, `Flush` a no-op — isolating the handler's own work.
   only `model`, `messages`, `max_tokens`, `stream`, `seed`.
 - Both callbacks go through the same cgo shim (`tcGoTokenCallback`), so the
   bridge's per-token transition and detokenization are inside BOTH numbers. The
-  delta isolates the gateway layer, not the bridge.
+  delta isolates the gateway layer, not the bridge. Sharing the shim removes the
+  bridge from the gateway DELTA only: it does not measure the absolute
+  server-vs-`tinycoder_bench` gap.
 - Sampling at temperature 0.7 is stochastic and the engine keeps a persistent
   RNG (seed 0 seeds once from `random_device`, then continues), so the two
   paths cannot otherwise be guaranteed to emit the same number of tokens. Each
@@ -157,6 +164,15 @@ BenchmarkGatewayHandler-72  10  703239506 ns/op  182.0 tok/s  128.0 tokens/op  1
 BenchmarkGatewayHandler-72  10  710196182 ns/op  180.2 tok/s  128.0 tokens/op  134901 B/op  759 allocs/op
 ```
 
+Qwen paired (`BenchmarkGatewayDelta`, `-benchtime=10x -count=3`, 10 pairs per
+run; `delta-ns/op` is the mean per-pair delta, i.e. per request):
+
+```
+      10  1516925663 ns/op  26474732 delta-ns/op  +12.40 delta-pct-max   +3.756 delta-pct-mean  -7.384 delta-pct-min  5.696 delta-pct-std  723.8 direct-ms/op  750.3 gateway-ms/op  10 pairs
+      10  1538932922 ns/op  11502570 delta-ns/op  +11.38 delta-pct-max   +1.680 delta-pct-mean  -7.292 delta-pct-min  6.489 delta-pct-std  740.1 direct-ms/op  751.6 gateway-ms/op  10 pairs
+      10  1532554187 ns/op  26635046 delta-ns/op  +11.40 delta-pct-max   +3.747 delta-pct-mean  -1.302 delta-pct-min  5.042 delta-pct-std  731.7 direct-ms/op  758.3 gateway-ms/op  10 pairs
+```
+
 Ornith 9B, `-benchtime=10x -count=5`:
 
 ```
@@ -196,6 +212,14 @@ BenchmarkSSEWrite-72   858702  2620 ns/op  282 B/op  3 allocs/op
 amortise the benchmark harness's fixed per-run cost; the time-based run is the
 real per-frame cost.)
 
+Auditability: raw console lines are pasted above for Qwen
+direct/gateway/handler-only/paired and for the Ornith and Bonsai sustained
+direct/gateway bursts. The **Ornith and Bonsai handler-only rows, the Ornith and
+Bonsai paired rows, and the fresh single-path Qwen runs** are derived from the
+aggregate runs; their raw console lines were not retained. The derived tables
+below are consequently reproducible only at the aggregate level, not from
+retained console output.
+
 ## Derived numbers
 
 Separate runs are sustained 10-iteration bursts; they are *not* paired across
@@ -215,12 +239,15 @@ completeness.
 | Bonsai 27B | gateway | 3028.2 | 42.3 | 3030.4 | 42.2 | 42.2–42.4 |
 | Bonsai 27B | handler only | 3081.0 | 41.5 | 3111.2 | 41.1 | 41.1–42.4 |
 
-Direct-path note: the handler-only path is indistinguishable from direct on
-Qwen (+0.3 %) and Ornith (−1.4 %) and is +2.5 % on Bonsai (process-to-process
-GPU variance is ±2–3 %, so this is noise). That is the server handler's own
-cost: request decode, preflight, manager, and `json.Marshal`+`Fprintf` per
-token, with no socket and a no-op `Flush`. It does not explain the end-to-end
-delta.
+Direct-path note: the handler-only path is indistinguishable from direct on all
+three models. Against each model's separate-run direct mean, Qwen is −0.3 %
+(handler 705.1 ms vs direct 707.5 ms; using the fresh single-path 703.2 ms
+baseline instead flips the sign to +0.3 %, which shows the comparison is below
+the process noise floor), Ornith is −1.4 %, and Bonsai is +2.5 %
+(process-to-process GPU variance is ±2–3 %, so all three are noise). That is the
+server handler's own cost: request decode, preflight, manager, and
+`json.Marshal`+`Fprintf` per token, with no socket and a no-op `Flush`. It does
+not explain the end-to-end delta.
 
 The paired direct runs differ from these separate direct runs by up to ~3 %
 (Qwen paired direct ≈ 732 ms vs 707 ms separate; Bonsai 3088–3102 ms vs
@@ -230,10 +257,12 @@ neither number is wrong, but the paired ratio uses its own direct denominator.
 
 ## Paired per-iteration measurement (end-to-end delta)
 
-`BenchmarkGatewayDelta`, `-benchtime=10x -count=3` = 3 × 10 adjacent pairs.
-Per-pair ratio = (gateway − direct)/direct for the same seed and iteration;
-sign is alternated by iteration parity. `delta-pct-mean/std/min/max` are the
-statistics over the 10 pairs of each run:
+`BenchmarkGatewayDelta`, `-benchtime=10x -count=3` = 3 × 10 pairs, each pair
+one direct and one gateway call. Per-pair ratio = (gateway − direct)/direct for
+the same seed and iteration; the ratio's sign is always this definition, while
+the ORDER of the two calls alternates by iteration parity. Each call is preceded
+by the untimed 1-token `resetSampler` described above. `delta-pct-mean/std/min/max`
+are the statistics over the 10 pairs of each run:
 
 | model | run | mean | std | min | max | aggregate Δ ms/request | aggregate % |
 |---|---|---|---|---|---|---|---|
@@ -251,7 +280,9 @@ statistics over the 10 pairs of each run:
 | Bonsai 27B | all | | | | | +6.82 | **+0.22 %** |
 
 (The aggregate % is Δ over the sum of direct means, i.e. the ratio of the
-per-pair delta totals; it is not the average of the three per-run means.)
+per-pair delta totals; it is not the average of the three per-run means. The
+Qwen rows' raw console lines are pasted above; the Ornith and Bonsai rows are
+derived from the aggregate runs — raw lines not retained.)
 
 At the fast model the per-pair spread is large (σ ≈ 5–6 %, single pairs from
 −7 % to +12 %), so the mean is not tightly determined: the three run means are
@@ -262,31 +293,41 @@ gateway's own handler/serialization is far below it.
 Sustained-burst comparisons (direct burst mean vs gateway burst mean, all
 counts of one path before the other, order/thermal effects included):
 
-| model | direct ms | gateway ms | Δ per request | Δ % |
-|---|---|---|---|---|
-| Qwen 1.5B | 707.5 | 760.1 | +52.7 ms | +7.4 % |
-| Qwen 1.5B (fresh single-path processes) | 703.2 | 743.1 | +39.9 ms | +5.7 % |
-| Ornith 9B | 2043.7 | 2081.5 | +37.8 ms | +1.9 % |
-| Bonsai 27B | 3005.3 | 3028.2 | +22.9 ms | +0.8 % |
+| model | direct ms | gateway ms | Δ per request | Δ % per-request time | throughput change |
+|---|---|---|---|---|---|
+| Qwen 1.5B | 707.5 | 760.1 | +52.7 ms | +7.4 % | −6.9 % (180.9 → 168.4 tok/s) |
+| Qwen 1.5B (fresh single-path processes) | 703.2 | 743.1 | +39.9 ms | +5.7 % | −5.3 % (182.0 → 172.3 tok/s) |
+| Ornith 9B | 2043.7 | 2081.5 | +37.8 ms | +1.9 % | −1.8 % (62.6 → 61.5 tok/s) |
+| Bonsai 27B | 3005.3 | 3028.2 | +22.9 ms | +0.8 % | −0.7 % (42.6 → 42.3 tok/s) |
+
+The Δ % column is per-request time (positive = slower); the last column is the
+corresponding throughput loss. The two are not interchangeable.
 
 ## Decomposition
 
-| model | engine direct ms/token | SSE `write` + `Flush` per token | handler-only vs direct | end-to-end paired delta | sustained burst delta |
+| model | engine direct ms/token (separate burst) | SSE `write` + `Flush` per token | handler-only vs direct mean (separate burst) | end-to-end paired delta (paired direct baseline) | sustained burst delta (separate direct baseline) |
 |---|---|---|---|---|---|
-| Qwen 1.5B | 5.53 (180.9 tok/s) | 2.62 µs = **0.047 %** | +0.3 % | +0.168 ms = +2.9 % | +0.31 ms = +5.7 % (fresh single-path) |
+| Qwen 1.5B | 5.53 (180.9 tok/s) | 2.62 µs = **0.047 %** | −0.3 % (705.1 vs 707.5 ms) | +0.168 ms = +2.9 % | +0.31 ms = +5.7 % (fresh single-path) |
 | Ornith 9B | 15.97 (62.6 tok/s) | 2.62 µs = **0.016 %** | −1.4 % (noise) | +0.121 ms = +0.8 % | +0.30 ms = +1.9 % |
 | Bonsai 27B | 23.48 (42.6 tok/s) | 2.62 µs = **0.011 %** | +2.5 % (noise) | +0.053 ms = +0.2 % | +0.18 ms = +0.8 % |
 
-The SSE share uses each model's *own* engine token time, so it is larger for
-the fast model in percentage terms while still under 0.05 %. Everything else in
-the end-to-end delta is outside the handler: socket transport, the in-process
-client's read/parse/wake-ups, and scheduling contention with the engine's 72
-threads. Two caveats matter: (a) the client in this harness is in the same
-process, so part of that cost would be remote in a real deployment; (b)
-`sseWriter.write` and `Flush` run synchronously inside the engine's token
-callback on the generation thread, so a *slow remote consumer* can still
-back-pressure and throttle generation — this loopback harness cannot measure
-that case, and the 2.6 µs figure is the serialization cost only, not a
+The baselines are not the same across columns. The engine-direct and
+handler-only columns use the table's separate-burst direct mean (Qwen
+5.53 ms/token, i.e. 707.5 ms per 128-token request). The sustained column uses
+each row's stated separate-run direct baseline — for Qwen the fresh single-path
+703.2 ms (5.49 ms/token) for the +5.7 % cell, or 707.5 ms (5.53 ms/token) for
+the +7.4 % combined run. The paired column instead uses the paired direct mean
+(Qwen ≈5.72 ms/token, 732 ms/request), so `0.168 ms / 5.72 ms = 2.9 %`, not
+`0.168 / 5.53 = 3.0 %`. The SSE share uses each model's *own* engine token time,
+so it is larger for the fast model in percentage terms while still under
+0.05 %. Everything else in the end-to-end delta is outside the handler: socket
+transport, the in-process client's read/parse/wake-ups, and scheduling
+contention with the engine's 72 threads. Two caveats matter: (a) the client in
+this harness is in the same process, so part of that cost would be remote in a
+real deployment; (b) `sseWriter.write` and `Flush` run synchronously inside the
+engine's token callback on the generation thread, so a *slow remote consumer*
+can still back-pressure and throttle generation — this loopback harness cannot
+measure that case, and the 2.6 µs figure is the serialization cost only, not a
 guarantee about a slow consumer.
 
 ## CPU profile
@@ -335,16 +376,17 @@ Dropped 209 nodes (cum <= 0.41s)
 
 Supplemental SSEWrite profile (1 M frames): `encoding/json.structEncoder.encode`
 44.7 % cum, `fmt.Fprintf` 7.9 %; total 2.6 µs/frame, so pre-serializing a frame
-could save at most ~1 µs/token — 0.013 % of engine time at 64 tok/s.
+could save at most ~1 µs/token — 0.0064 % of engine time at 64 tok/s
+(1 µs / 15.6 ms).
 
 ## Comparison with the report (§4.7)
 
 | report data point (`tinycoder_bench` vs server) | this measurement (engine direct vs HTTP gateway) |
 |---|---|
-| Qwen2.5-Coder-1.5B 416 → 234 tok/s (−44 %) | **Qwen2.5-Coder-1.5B Q2_K: 180.9 → 168.4 tok/s sustained (−7.4 %), +2.9 % paired** on this host |
+| Qwen2.5-Coder-1.5B 416 → 234 tok/s (−44 %) | **Qwen2.5-Coder-1.5B Q2_K: 180.9 → 168.4 tok/s sustained (−6.9 % throughput; +7.4 % per-request time), +2.9 % paired time** on this host |
 | Qwen3.6-27B 33 → 20 tok/s (−39 %) | not available locally and not reproduced; conclusion is by generalization from the per-token serialization cost (0.011–0.016 %) and the measured fast/slow models |
-| Bonsai 69 → 57 tok/s (−17 %) | 42.6 → 42.3 tok/s sustained (−0.8 %), +0.2 % paired |
-| faster model ⇒ larger loss | reproduced in *direction* (Qwen +2.9/+7.4 %, Ornith +0.8 %, Bonsai +0.2 %), but it is transport/client cost, and the magnitude is 3–7 %, not 44 % |
+| Bonsai 69 → 57 tok/s (−17 %) | 42.6 → 42.3 tok/s sustained (−0.7 % throughput; +0.8 % per-request time), +0.2 % paired time |
+| faster model ⇒ larger loss | reproduced in *direction* (per-request time: Qwen +2.9 % paired / +7.4 % sustained, Ornith +0.8 %, Bonsai +0.2 % paired; throughput losses −6.9 % / −1.8 % / −0.7 % respectively), but it is transport/client cost, and the magnitude is 3–7 %, not 44 % |
 
 Factors that differ; they were controlled or excluded here:
 
@@ -352,9 +394,13 @@ Factors that differ; they were controlled or excluded here:
    engine directly; the server number is an HTTP/SSE client measurement. Any
    fixed per-token consumer/transport cost is divided by a shrinking per-token
    engine time as models get faster. This is the one factor our data confirms
-   *directionally*: 0.15–0.31 ms/token of end-to-end cost is 0.2 % at 42 tok/s,
-   0.8 % at 63, and 2.9–5.7 % at 181. At the report's 416 tok/s it would be
-   ~6–13 % for the same fixed cost — meaningful, but still far from 44 %.
+   *directionally*. In the paired runs the extra per-token time is
+   0.053–0.168 ms (0.2 % at 42 tok/s, 0.8 % at 63, 2.9 % at 181, measured
+   against each pair's own direct baseline); in the sustained-burst runs it is
+   0.18–0.31 ms (0.8 % at 42, 1.9 % at 63, 5.7 % at 181, measured against the
+   separate direct burst). At the report's 416 tok/s (2.4 ms/token) the
+   sustained per-token cost would be ~7.5–13 % — meaningful, but still far from
+   44 %.
 2. **Different request semantics.** Here both sides render chat `Messages`
    through the model's chat template (prompt sizes in the model table), so the
    template is not a server-side penalty. `tinycoder_bench` may use a raw
@@ -368,9 +414,12 @@ Factors that differ; they were controlled or excluded here:
    throughput is lower here (Qwen 1.5B 181 tok/s direct vs the report's 416;
    Bonsai 42.6 vs 69), so absolute numbers are not comparable; the ratio is
    what this task tests.
-5. **Per-token bridge/cgo is ruled out by construction.** Both paths use the
-   same `tcGoTokenCallback`/shim, so detokenization and the cgo transition are
-   inside both numbers; they cannot be the gateway-specific delta.
+5. **Per-token bridge/cgo is removed from the gateway delta by construction.**
+   Both paths here use the same `tcGoTokenCallback`/shim, so detokenization and
+   the cgo transition are inside both numbers and cancel in the
+   gateway-vs-direct delta. That does not measure the absolute
+   server-vs-`tinycoder_bench` gap, whose baseline path may differ; bridge cost
+   is therefore not ruled out as a component of that gap.
 6. **Run-to-run noise.** Engine time varies ±2–3 % per 10-iteration burst on
    this host (GPU clock), which is larger than the small-model deltas; the
    paired benchmark exists to cancel it, and its per-pair spread is reported
@@ -382,24 +431,29 @@ Factors that differ; they were controlled or excluded here:
 
 - Load-bearing evidence: the server's own per-token gateway work is tiny. SSE
   serialization is **2.6 µs/token (0.011–0.047 %)**; the handler with no socket
-  or client is **indistinguishable from direct** (Qwen +0.3 %, Ornith −1.4 %,
-  Bonsai +2.5 % within process noise); the CPU profile is 99.4 % cgo/engine
-  with no Go hotspot; the profile-justified serialization optimization would
-  save <0.02 % of engine time.
+  or client is **indistinguishable from direct** (Qwen −0.3 % against the
+  separate-burst direct mean — 705.1 vs 707.5 ms, i.e. the sign is inside
+  process noise; Ornith −1.4 %, Bonsai +2.5 %; all within ±2–3 % process noise);
+  the CPU profile is 99.4 % cgo/engine with no Go hotspot; the
+  profile-justified serialization optimization would save <0.02 % of engine time
+  (~0.0064 % at 64 tok/s).
 - Supporting context: the end-to-end HTTP path (handler + loopback transport +
-  in-process client) costs +0.2 % (Bonsai) to +2.9 % (Qwen) paired, and up to
-  +5.7–7.4 % in sustained runs at 181 tok/s. This is above the ~2 % threshold
-  for the fast model, but it is **outside the handler** — it is socket
-  transport, client consumption and scheduling, not the SSE serialization the
-  task could optimize. The decision rule's threshold applies to gateway+SSE
-  work, which is 0.016–0.047 %.
+  in-process client) costs +0.2 % (Bonsai) to +2.9 % (Qwen) per-request time
+  paired, and up to +5.7–7.4 % per-request time in sustained runs at 181 tok/s
+  (throughput −5.4 % to −6.9 %). This is above the ~2 % threshold for the fast
+  model, but it is **outside the handler** — it is socket transport, client
+  consumption and scheduling, not the SSE serialization the task could
+  optimize. The decision rule's threshold applies to gateway+SSE work, which is
+  0.016–0.047 %.
 - The report's 7–44 % loss does not reproduce as gateway/SSE overhead. A
   smaller, model-speed-dependent transport/consumer effect is real (~3–7 % at
   181 tok/s here). The remaining difference must be measured on the report's
   harness/host: different benchmark params/prompt-output mix, an engine build
   without the F1/F2 fixes, thread/offload configuration, or client-side/network
-  overhead not represented by a loopback consumer. It is not detokenization or
-  the cgo bridge (controlled in both paths) and not `sseWriter.write`.
+  overhead not represented by a loopback consumer. Sharing the cgo shim
+  excludes detokenization and the bridge from the gateway delta, but it does not
+  measure the absolute server-vs-`tinycoder_bench` gap (the baseline path may
+  differ); the residual is also not `sseWriter.write` (2.6 µs/token).
 - If streaming cost ever needs to come down, the lever is the delivery path
   (flush batching / avoiding one syscall per token, or measuring a remote
   consumer), not pre-serializing the SSE frame; that is out of scope for this
@@ -428,3 +482,29 @@ Factors that differ; they were controlled or excluded here:
   direct and separate direct differ by ~3 %.
 - Raw results now carry benchmark-name prefixes (joined from Go's two-line
   progress output, whitespace collapsed).
+
+## Revision note (fix round 2, documentation accuracy)
+
+- Corrected the paired-ratio description: the ORDER alternates by parity; the
+  ratio's sign is always `(gateway − direct)/direct`.
+- Labeled time vs throughput everywhere: Qwen's throughput loss is −6.9 %
+  (180.9 → 168.4 tok/s), Bonsai's −0.7 % (42.6 → 42.3); the +7.4 % / +0.8 %
+  figures are per-request time increases.
+- Fixed the Qwen handler-only sign and stated its baseline (−0.3 % against the
+  705.1 vs 707.5 ms direct mean; +0.3 % against the fresh 703.2 ms baseline, so
+  the comparison is below the noise floor).
+- Fixed the mixed-denominator arithmetic in the transport-factor discussion:
+  paired deltas are 0.053–0.168 ms, sustained deltas 0.18–0.31 ms, each stated
+  against its own baseline.
+- Corrected the serialization-optimization estimate to ~0.0064 % at 64 tok/s
+  (1 µs / 15.6 ms).
+- Named each decomposition column's baseline (separate-burst direct vs paired
+  direct ≈5.72 ms/token) so the paired 2.9 % is not read against the separate
+  5.53 ms/token.
+- Noted the untimed 1-token `resetSampler` between paired members (both remain
+  in one iteration) and reworded the bridge/cgo claim: sharing the shim removes
+  it from the gateway delta only, not from the unmeasured absolute
+  server-vs-`tinycoder_bench` gap.
+- Added Qwen paired raw console lines and an explicit auditability note for the
+  Ornith/Bonsai handler-only and paired rows and the fresh single-path Qwen runs
+  (derived from the aggregate runs; raw lines not retained).

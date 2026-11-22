@@ -370,8 +370,29 @@ func TestApplyModelFlagsDerivesID(t *testing.T) {
 	if m.File != "/x/Ternary-Bonsai-2-27B-PQ2_0.gguf" {
 		t.Fatalf("file = %q, want the absolute path unchanged", m.File)
 	}
-	if m.ContextLength != 0 {
-		t.Fatalf("context_length = %d, want 0 (unset -> engine default)", m.ContextLength)
+	if m.ContextLength != Default().MaxSeqLen {
+		t.Fatalf("context_length = %d, want the inherited max_seq_len %d", m.ContextLength, Default().MaxSeqLen)
+	}
+}
+
+// TestApplyModelFlagsCtxZeroInheritsMaxSeqLen verifies that --ctx 0 (the
+// default) resolves to the configured max_seq_len so the advertised window and
+// the manager's effective window agree. An explicit --ctx > 0 is unchanged.
+func TestApplyModelFlagsCtxZeroInheritsMaxSeqLen(t *testing.T) {
+	cfg := Default()
+	cfg.MaxSeqLen = 16384
+	if err := cfg.ApplyModelFlags("/x/m.gguf", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Models[0].ContextLength; got != 16384 {
+		t.Fatalf("context_length = %d, want the configured max_seq_len 16384", got)
+	}
+
+	if err := cfg.ApplyModelFlags("/x/m.gguf", "", 2048); err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Models[0].ContextLength; got != 2048 {
+		t.Fatalf("explicit --ctx 2048 became %d, want 2048", got)
 	}
 }
 
@@ -423,8 +444,8 @@ func TestApplyModelFlagsExplicitIDRescuesEmptyStem(t *testing.T) {
 	if m.File != "/data/models/.gguf" {
 		t.Fatalf("file = %q, want the absolute path unchanged", m.File)
 	}
-	if m.ContextLength != 0 {
-		t.Fatalf("context_length = %d, want 0", m.ContextLength)
+	if m.ContextLength != Default().MaxSeqLen {
+		t.Fatalf("context_length = %d, want the inherited max_seq_len %d", m.ContextLength, Default().MaxSeqLen)
 	}
 }
 
@@ -712,6 +733,28 @@ func TestPreloadIDs(t *testing.T) {
 	cfg.Preload = false
 	if got := cfg.PreloadIDs(); got != nil {
 		t.Fatalf("PreloadIDs() with an empty list and preload disabled = %v, want nil", got)
+	}
+}
+
+// TestPreloadIDsDedupes verifies duplicate preload ids collapse to their first
+// occurrence, preserving order: one warm-up per model and no duplicate /readyz
+// entry.
+func TestPreloadIDsDedupes(t *testing.T) {
+	cfg := Default()
+	cfg.Models = []RegistryModel{{ID: "a"}, {ID: "b"}, {ID: "c"}}
+	cfg.PreloadModels = []string{"b", "a", "b", "c", "a"}
+	got := cfg.PreloadIDs()
+	want := []string{"b", "a", "c"}
+	if len(got) != len(want) {
+		t.Fatalf("PreloadIDs() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("PreloadIDs() = %v, want %v", got, want)
+		}
+	}
+	if len(cfg.PreloadModels) != 5 {
+		t.Fatalf("PreloadIDs mutated preload_models: %v", cfg.PreloadModels)
 	}
 }
 

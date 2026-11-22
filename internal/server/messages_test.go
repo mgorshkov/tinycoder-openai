@@ -1,9 +1,13 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -213,5 +217,26 @@ func TestMessagesStopReasonMaxTokens(t *testing.T) {
 	}
 	if out.StopReason != "max_tokens" {
 		t.Fatalf("stop_reason = %q, want max_tokens", out.StopReason)
+	}
+}
+
+// TestWriteMessagesErrorGatewayTimeout verifies that a manager/acquisition
+// deadline maps to an Anthropic-shaped 504, matching the OpenAI surfaces.
+func TestWriteMessagesErrorGatewayTimeout(t *testing.T) {
+	s := &Server{log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	for _, err := range []error{
+		context.DeadlineExceeded,
+		fmt.Errorf("acquire: %w", context.Canceled),
+	} {
+		rec := httptest.NewRecorder()
+		s.writeMessagesError(rec, err)
+		if rec.Code != http.StatusGatewayTimeout {
+			t.Fatalf("writeMessagesError(%v) status = %d, want 504", err, rec.Code)
+		}
+		body := rec.Body.String()
+		if !strings.Contains(body, `"type":"api_error"`) ||
+			!strings.Contains(body, `"message":"generation canceled"`) {
+			t.Fatalf("writeMessagesError(%v) body = %s, want an api_error generation canceled", err, body)
+		}
 	}
 }

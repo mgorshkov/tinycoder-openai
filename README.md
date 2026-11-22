@@ -63,7 +63,8 @@ VBMI/VBMI2, Sapphire Rapids for AMX, alongside a matching
 
 See [`deploy/`](deploy/) for a systemd unit, an nginx reverse-proxy snippet
 (with SSE buffering disabled) and a Dockerfile. The server exposes `/healthz`
-for liveness and `/readyz` for readiness checks, and streams SSE with
+for liveness and `/readyz` for readiness checks; the snippet proxies both probe
+paths explicitly so they bypass its catch-all, and the server streams SSE with
 `X-Accel-Buffering: no` so nginx does not buffer token chunks.
 
 ### deploy.sh
@@ -118,9 +119,11 @@ to read the manifest; destination directories are created as needed.
   While the model is loading or the prompt is being prefilled
   (which can take a while for large prompts and no tokens are produced yet), the
   server emits SSE keep-alive comment lines (`: keep-alive`) so clients do not
-  hit their idle read timeout; a generation failure is surfaced as an SSE error
-  event (followed by `[DONE]` on the completions endpoints) instead of a
-  silently truncated stream.
+  hit their idle read timeout; a generation failure is surfaced instead of a
+  silently truncated stream: `/v1/chat/completions` and `/v1/completions` emit
+  an SSE `error` event followed by `[DONE]`, `/v1/responses` terminates with
+  `response.failed` carrying `response.error{code,message}`, and `/v1/messages`
+  uses an Anthropic `error` event.
 - **Tool calling** (OpenAI `tools` / `tool_choice` / `tool_calls`), including
   streamed tool-call deltas and `finish_reason: "tool_calls"`, so agentic
   clients such as Roo Code can drive function calls.
@@ -196,9 +199,10 @@ a blocking C call that cannot be canceled, so a budget expiry is reported as
 once it finishes).
 
 Readiness is sticky on success: a later idle eviction does not flip a warmed
-process back to `503`. A failed warm-up stays reported until that model loads
-successfully — a lazy request that loads it clears the error. Both probes are
-unauthenticated.
+process back to `503`. A `ready` process can still pay a cold model load on the
+first request after an idle eviction. A failed warm-up stays reported until that
+model loads successfully — a lazy request that loads it clears the error. Both
+probes are unauthenticated.
 
 ### Quick start
 
@@ -331,7 +335,7 @@ Precedence: **flags > environment > JSON file > built-in defaults**.
 | `--log-level` | `TINYCODER_LOG_LEVEL` | `info` | `debug`/`info`/`warn`/`error` |
 | `--model` | — | — | Serve exactly this model, replacing the config `models` registry |
 | `--model-id` | — | slugified base name of the file without a `.gguf` extension | Served id for `--model` |
-| `--ctx` | — | `0` (engine default) | Context length for `--model` |
+| `--ctx` | — | `0` (inherits `max_seq_len`) | Context window for the flag-provided model; `0` inherits `max_seq_len` (8192 by default) |
 
 For one-model-per-process operation (like `llama-server`) the binary can serve
 a single model without a config-file registry:
@@ -347,8 +351,9 @@ file), so exactly that one model is served and no field is inherited from the
 file's first entry. `--model-id` defaults to the slugified base name of the file
 without a `.gguf` extension (other dotted suffixes are part of the name, e.g. an
 EXL3 checkpoint directory), a relative `--model` is resolved against the process
-working directory (not `models_dir`), and `--ctx 0` uses the engine's context
-length. `--model-id` or `--ctx` without `--model` is a startup error.
+working directory (not `models_dir`), and `--ctx 0` (the default) inherits
+`max_seq_len` (8192 by default). `--model-id` or `--ctx` without `--model` is a
+startup error.
 
 Because `--model` replaces the registry, any `preload_models` from the config
 file or `TINYCODER_PRELOAD_MODELS` must name the flag-provided id or be cleared;
@@ -394,9 +399,11 @@ first request, so an orchestrator can gate traffic on `/readyz`:
   precedence over `preload` when both are set). `preload: true` with several
   models and no list is a startup validation error.
 - `preload_timeout_sec` (default `300`; `0` disables the bound) bounds one
-  model's warm-up by canceling its load context. A failed load (for example a
-  missing model file) reports `503 error` on `/readyz` instead of remaining
-  `loading`; an engine that ignores cancellation can still outlast the budget.
+  model's warm-up by canceling its load context. The budget is reporting-only:
+  the context is canceled, but the engine may ignore that (a blocking native
+  load), so an expiry is reported as `503 error` even while the load may still
+  be running. A failed load (for example a missing model file) reports
+  `503 error` on `/readyz` instead of remaining `loading`.
 - Targets are warmed sequentially in the background; startup and `/healthz` are
   not delayed.
 

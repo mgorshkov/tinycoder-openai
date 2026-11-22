@@ -39,7 +39,7 @@ func run() error {
 		logLevel   = flag.String("log-level", "", "log level: debug|info|warn|error (overrides config)")
 		model      = flag.String("model", "", "one-model mode: model file path (replaces the config models list)")
 		modelID    = flag.String("model-id", "", "one-model mode: served model id (defaults to the slugified base name of the file without a .gguf extension)")
-		ctxLen     = flag.Int("ctx", 0, "one-model mode: context length (0 = engine default)")
+		ctxLen     = flag.Int("ctx", 0, "one-model mode: context length for --model (0 inherits max_seq_len, 8192 by default)")
 		showVer    = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
