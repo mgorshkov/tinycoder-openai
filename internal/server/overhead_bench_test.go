@@ -42,7 +42,11 @@ package server
 //     difference isolates the gateway/SSE layer, not the bridge.
 //   - BenchmarkGatewayDelta is a paired cross-check: it measures direct and
 //     gateway back-to-back for the same seed (alternating order), because GPU
-//     clock drift between two separate timed bursts is larger than the delta.
+//     clock drift between two separate timed bursts is larger than the delta,
+//     and reports the per-pair ratio distribution.
+//   - BenchmarkGatewayHandler runs the same request through the handler with a
+//     ResponseRecorder (no TCP, no HTTP client), isolating the gateway's own
+//     serialization work from socket transport and client consumption.
 
 import (
 	"bufio"
@@ -53,6 +57,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -209,7 +214,7 @@ func newBenchEnv(modelPath string) (*benchEnv, error) {
 	cfg.MaxLoadedModels = 1
 	cfg.MaxConcurrent = 1
 	// Disable the inactivity watchdog: it is a timing guard, not part of the
-	// per-token path, and the brief specifies 0 here.
+	// per-token path. 0 is the config default (config.Default() sets it to 0).
 	cfg.NoTokenTimeoutSec = 0
 
 	// A discard logger keeps the per-request access log from dominating the
@@ -471,7 +476,10 @@ func BenchmarkGatewayDelta(b *testing.B) {
 		return elapsed, nil
 	}
 
-	var directTotal, gatewayTotal time.Duration
+	var (
+		directTotal, gatewayTotal time.Duration
+		ratios                    = make([]float64, 0, b.N)
+	)
 	for i := 0; i < b.N; i++ {
 		seed := uint32(i%benchSeedCount) + 1
 		var d, g time.Duration
@@ -493,16 +501,84 @@ func BenchmarkGatewayDelta(b *testing.B) {
 		}
 		directTotal += d
 		gatewayTotal += g
+		if d > 0 {
+			ratios = append(ratios, 100*float64(g-d)/float64(d))
+		}
 	}
 	if b.N > 0 {
 		n := float64(b.N)
 		b.ReportMetric(float64(directTotal.Nanoseconds())/n/1e6, "direct-ms/op")
 		b.ReportMetric(float64(gatewayTotal.Nanoseconds())/n/1e6, "gateway-ms/op")
 		b.ReportMetric(float64((gatewayTotal-directTotal).Nanoseconds())/n, "delta-ns/op")
-		if directTotal > 0 {
-			b.ReportMetric(100*float64(gatewayTotal-directTotal)/float64(directTotal), "gateway-delta-%")
+		if len(ratios) > 0 {
+			mean, std, lo, hi := meanStdMinMax(ratios)
+			b.ReportMetric(mean, "delta-pct-mean")
+			b.ReportMetric(std, "delta-pct-std")
+			b.ReportMetric(lo, "delta-pct-min")
+			b.ReportMetric(hi, "delta-pct-max")
+			b.ReportMetric(float64(len(ratios)), "pairs")
 		}
 	}
+}
+
+// meanStdMinMax returns the sample mean, sample standard deviation, minimum and
+// maximum of v.
+func meanStdMinMax(v []float64) (mean, std, lo, hi float64) {
+	lo, hi = v[0], v[0]
+	for _, x := range v {
+		mean += x
+		if x < lo {
+			lo = x
+		}
+		if x > hi {
+			hi = x
+		}
+	}
+	mean /= float64(len(v))
+	if len(v) > 1 {
+		var ss float64
+		for _, x := range v {
+			d := x - mean
+			ss += d * d
+		}
+		std = math.Sqrt(ss / float64(len(v)-1))
+	}
+	return mean, std, lo, hi
+}
+
+// BenchmarkGatewayHandler runs the streaming chat request through the HTTP
+// handler in-process with an httptest.ResponseRecorder: no TCP socket and no
+// HTTP client, and Recorder.Flush is a no-op. It isolates the gateway's own
+// per-token work (request decode, preflight, manager, token→SSE serialization)
+// from socket transport and client consumption, and is the committed version of
+// the attribution probe used in the report.
+func BenchmarkGatewayHandler(b *testing.B) {
+	env := benchSetup(b)
+	handler := env.server.Config.Handler
+	if err := env.resetSampler(); err != nil {
+		b.Fatalf("reset sampler: %v", err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	tokens := 0
+	for i := 0; i < b.N; i++ {
+		seed := uint32(i%benchSeedCount) + 1
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(env.bodies[seed-1]))
+		req.Header.Set("Content-Type", "application/json")
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			b.Fatalf("iteration %d (seed %d): HTTP %d", i, seed, rec.Code)
+		}
+		// Empty content values are omitted by the DTO, so the presence of
+		// "content":" is exactly one non-empty delta.content value.
+		n := strings.Count(rec.Body.String(), `"content":"`)
+		if want := env.expected[seed-1]; n != want {
+			b.Fatalf("iteration %d (seed %d): handler streamed %d content deltas, direct generate produced %d tokens", i, seed, n, want)
+		}
+		tokens += n
+	}
+	reportThroughput(b, tokens)
 }
 
 // BenchmarkSSEWrite isolates the pure SSE serialization cost per token:
