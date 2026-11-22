@@ -59,6 +59,24 @@ func (s *Stub) Capabilities() Capabilities {
 	return Capabilities{Native: false, Streaming: true, Chat: true}
 }
 
+// CountPromptTokens estimates the prompt's token count (about four bytes per
+// token) without a real tokenizer. Chat messages include a small per-message
+// overhead for the role/template markers the native engine would render.
+func (s *Stub) CountPromptTokens(req GenerateRequest) (int, error) {
+	if len(req.Messages) > 0 {
+		n := 0
+		for _, m := range req.Messages {
+			n += len(m.Content)/4 + 4
+		}
+		return n, nil
+	}
+	n := len(req.Prompt) / 4
+	if n < 1 {
+		n = 1
+	}
+	return n, nil
+}
+
 // Generate emits a deterministic token stream. Words of a canned reply are
 // streamed one at a time with small delays so streaming clients can be tested.
 func (s *Stub) Generate(ctx context.Context, req GenerateRequest, onToken TokenFunc) (Usage, error) {

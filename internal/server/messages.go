@@ -130,6 +130,13 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Reject an oversized prompt before opening a stream or generating. The
+	// Anthropic error shape carries a type and message, but no code.
+	if err := s.checkContextWindow(r, modelID, genReq); err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+
 	if req.Stream {
 		s.streamMessages(w, r, modelID, genReq)
 		return

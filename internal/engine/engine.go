@@ -27,6 +27,10 @@ var (
 	// no-token timeout. It surfaces a hung/misconfigured engine as a bounded
 	// (non-200) failure instead of letting the request wedge forever.
 	ErrNoToken = errors.New("no token produced within timeout")
+	// ErrContextLength indicates the prompt does not fit the model's context
+	// window. The callers map it to a client error instead of streaming an
+	// empty success.
+	ErrContextLength = errors.New("context length exceeded")
 )
 
 // Message is a single chat turn.
@@ -152,6 +156,10 @@ type Engine interface {
 	// aggregate token usage. Implementations abort cooperatively when ctx is
 	// canceled (they must check ctx between layers/blocks, not only per token).
 	Generate(ctx context.Context, req GenerateRequest, onToken TokenFunc) (Usage, error)
+	// CountPromptTokens renders the request's prompt (through the model's chat
+	// template when Messages are set) and returns its token count. Engines that
+	// cannot tokenize return 0 with an error; callers skip the window check.
+	CountPromptTokens(req GenerateRequest) (int, error)
 	// Capabilities reports supported features.
 	Capabilities() Capabilities
 }

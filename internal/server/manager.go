@@ -364,6 +364,35 @@ func (m *Manager) acquireSem(ctx context.Context) error {
 
 func (m *Manager) releaseSem() { <-m.sem }
 
+// PromptTokens returns the request's prompt token count and the model's
+// effective context window, loading the model if needed. A zero window means
+// unknown and callers must skip the check. Errors mean "cannot determine".
+func (m *Manager) PromptTokens(ctx context.Context, id string, req engine.GenerateRequest) (promptTokens, window int, err error) {
+	// The preflight only needs the model, not a generation slot: do not take the
+	// global semaphore (that would queue the request twice).
+	lease, err := m.Acquire(ctx, id)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer lease.Release()
+
+	window = lease.Info().ContextLength
+	if window == 0 {
+		if rm, ok := m.ModelByID(id); ok {
+			window = rm.ContextLength
+		}
+	}
+	if window == 0 {
+		window = m.cfg.MaxSeqLen
+	}
+
+	promptTokens, err = lease.Model().CountPromptTokens(req)
+	if err != nil {
+		return 0, window, err
+	}
+	return promptTokens, window, nil
+}
+
 // Generate acquires the model, runs generation, and releases it. It also
 // enforces the global concurrency limit.
 //

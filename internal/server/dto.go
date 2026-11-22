@@ -6,6 +6,8 @@ import (
 	"errors"
 	"strings"
 	"time"
+
+	"github.com/mgorshkov/tinycoder-openai/internal/engine"
 )
 
 // ---- Models ----
@@ -349,7 +351,7 @@ func nowUnix() int64 { return time.Now().Unix() }
 // errorTypeFor maps an error to an OpenAI-style type string.
 func errorTypeFor(err error) string {
 	switch {
-	case errors.Is(err, ErrModelNotFound):
+	case errors.Is(err, ErrModelNotFound), errors.Is(err, engine.ErrContextLength):
 		return "invalid_request_error"
 	default:
 		return "server_error"
