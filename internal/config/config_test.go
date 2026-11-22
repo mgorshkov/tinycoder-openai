@@ -80,6 +80,94 @@ func TestLoadOverlaysDefaults(t *testing.T) {
 	}
 }
 
+// TestLoadReplacesModels verifies that a "models" list present in the file
+// replaces the built-in registry exactly: fields the file omits must be zero,
+// never inherited from the built-in model at the same slice index (report
+// defect 5: a one-model config leaked architecture/quantization/description
+// from built-in model 0).
+func TestLoadReplacesModels(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cfg.json")
+	body := `{"models":[{"id":"ornith","name":"Ornith","file":"ornith.gguf","context_length":33536}]}`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Models) != 1 {
+		t.Fatalf("len(models) = %d, want 1: %+v", len(cfg.Models), cfg.Models)
+	}
+	m := cfg.Models[0]
+	if m.ID != "ornith" {
+		t.Fatalf("id = %q, want %q", m.ID, "ornith")
+	}
+	if m.ContextLength != 33536 {
+		t.Fatalf("context_length = %d, want 33536", m.ContextLength)
+	}
+	if m.Architecture != "" || m.Quantization != "" || m.Description != "" {
+		t.Fatalf("file-omitted fields leaked from the built-in registry: architecture=%q quantization=%q description=%q",
+			m.Architecture, m.Quantization, m.Description)
+	}
+}
+
+// TestLoadEmptyModelsServesNone verifies an explicit empty list serves no
+// models rather than falling back to the built-ins.
+func TestLoadEmptyModelsServesNone(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cfg.json")
+	if err := os.WriteFile(path, []byte(`{"models":[]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Models) != 0 {
+		t.Fatalf("len(models) = %d, want 0: %+v", len(cfg.Models), cfg.Models)
+	}
+}
+
+// TestLoadModelsKeyCaseInsensitive verifies a "Models"/"MODELS" top-level key
+// behaves like "models" instead of adding a second key that json.Marshal sorts
+// after the built-in one (which silently ignored the file's list).
+func TestLoadModelsKeyCaseInsensitive(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cfg.json")
+	body := `{"Models":[{"id":"solo","name":"Solo","file":"solo.gguf"}]}`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Models) != 1 {
+		t.Fatalf("len(models) = %d, want 1: %+v", len(cfg.Models), cfg.Models)
+	}
+	if cfg.Models[0].ID != "solo" {
+		t.Fatalf("id = %q, want %q", cfg.Models[0].ID, "solo")
+	}
+}
+
+// TestLoadMissingModelsKeepsBuiltin verifies a config file without a "models"
+// key still serves the built-in registry.
+func TestLoadMissingModelsKeepsBuiltin(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cfg.json")
+	if err := os.WriteFile(path, []byte(`{"listen":":1234"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := len(Default().Models); len(cfg.Models) != want {
+		t.Fatalf("len(models) = %d, want %d built-ins", len(cfg.Models), want)
+	}
+}
+
 func TestAuthKeySet(t *testing.T) {
 	cfg := Default()
 	cfg.APIKeys = []string{"sk-one", "sk-two", "", "  "}

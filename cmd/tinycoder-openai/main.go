@@ -63,7 +63,7 @@ func run() error {
 		cfg.LogLevel = *logLevel
 	}
 	// The config file is the authoritative registry: /v1/models advertises only
-	// the models declared under "models" (plus the built-in defaults). Models
+	// the models declared under "models", which replace the built-in list. Models
 	// found by scanning models_dir are intentionally NOT advertised, so an
 	// untested or unsupported GGUF on disk can never be exposed (or selected)
 	// through the API. Add it to "models" to publish it.
