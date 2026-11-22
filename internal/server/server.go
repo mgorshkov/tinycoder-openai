@@ -36,8 +36,8 @@ func New(cfg config.Config, mgr *Manager, log *slog.Logger) *Server {
 func (s *Server) Handler() http.Handler { return s.handler }
 
 // routes registers all endpoints under the canonical /v1 prefix (served at
-// https://api.tinycoder.dev/v1), plus the operational endpoints: /healthz and
-// the OpenAPI document.
+// https://api.tinycoder.dev/v1), plus the operational endpoints: /healthz,
+// /readyz and the OpenAPI document.
 func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
 
@@ -49,8 +49,10 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/v1/responses", s.handleResponses)
 	mux.HandleFunc("/v1/messages", s.handleMessages)
 
-	// Operational endpoints.
+	// Operational endpoints. /healthz is liveness only (always 200 while the
+	// process serves); /readyz also accounts for the model warm-up.
 	mux.HandleFunc("/healthz", s.handleHealth)
+	mux.HandleFunc("/readyz", s.handleReady)
 	mux.HandleFunc("/openai.json", s.handleSpec)
 	mux.HandleFunc("/openai.yaml", s.handleSpec)
 

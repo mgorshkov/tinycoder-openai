@@ -29,8 +29,11 @@ type entry struct {
 	// mu serializes load/unload/generate for this model. A Generate call holds
 	// it for the whole request, which is required because the underlying engine
 	// uses a single KV cache and prints to stdout.
-	mu       sync.Mutex
-	loaded   bool
+	mu sync.Mutex
+	// loaded is accessed under m.mu by IsLoaded/evictIdle/residentCountLocked/
+	// pickVictimLocked and under e.mu by Acquire/unload; making it atomic keeps
+	// /readyz and /v1/models polling from racing an in-flight load/unload.
+	loaded   atomic.Bool
 	inUse    bool
 	evicting bool
 	lastUsed time.Time
@@ -54,6 +57,13 @@ type Manager struct {
 	// It is admission (queue depth) only: a caller holding a slot has not
 	// necessarily started generating.
 	sem chan struct{}
+
+	// preloadMu guards the startup warm-up state read by Readiness. It is
+	// independent of mu/e.mu: Readiness must stay cheap and never block behind a
+	// load or a generation.
+	preloadMu   sync.Mutex
+	warm        map[string]bool   // models warmed at least once (sticky)
+	preloadErrs map[string]string // last warm-up failure per model
 
 	// exec serializes actual engine calls across all models. The native engine is
 	// single-tenant — one process-wide ThreadPool task slot and one GPU device —
@@ -79,12 +89,14 @@ func NewManager(cfg config.Config, factory engine.Factory, log *slog.Logger) *Ma
 		cfg.MaxConcurrent = 1
 	}
 	m := &Manager{
-		cfg:     cfg,
-		factory: factory,
-		log:     log,
-		entries: make(map[string]*entry, len(cfg.Models)),
-		sem:     make(chan struct{}, cfg.MaxConcurrent),
-		stopCh:  make(chan struct{}),
+		cfg:         cfg,
+		factory:     factory,
+		log:         log,
+		entries:     make(map[string]*entry, len(cfg.Models)),
+		warm:        make(map[string]bool, len(cfg.Models)),
+		preloadErrs: make(map[string]string),
+		sem:         make(chan struct{}, cfg.MaxConcurrent),
+		stopCh:      make(chan struct{}),
 	}
 	m.cond = sync.NewCond(&m.mu)
 	for _, rm := range cfg.Models {
@@ -106,7 +118,7 @@ func (m *Manager) IsLoaded(id string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	e, ok := m.entries[id]
-	return ok && e.loaded
+	return ok && e.loaded.Load()
 }
 
 // ModelByID returns the registry entry for id.
@@ -156,7 +168,7 @@ func (m *Manager) evictIdle() {
 	m.mu.Lock()
 	now := time.Now()
 	for _, e := range m.entries {
-		if e.loaded && !e.inUse && !e.evicting && now.Sub(e.lastUsed) > timeout {
+		if e.loaded.Load() && !e.inUse && !e.evicting && now.Sub(e.lastUsed) > timeout {
 			e.evicting = true
 			victims = append(victims, e)
 		}
@@ -171,7 +183,7 @@ func (m *Manager) evictIdle() {
 func (m *Manager) unload(e *entry) {
 	e.mu.Lock()
 	err := e.engine.Unload()
-	e.loaded = false
+	e.loaded.Store(false)
 	e.info = engine.ModelInfo{}
 	e.mu.Unlock()
 	m.mu.Lock()
@@ -225,18 +237,19 @@ func (m *Manager) Acquire(ctx context.Context, id string) (*Lease, error) {
 	// block here until it releases.
 	e.mu.Lock()
 
-	if e.loaded && e.engine.Loaded() {
+	if e.loaded.Load() && e.engine.Loaded() {
 		m.markInUse(e)
+		m.recordWarm(e.id)
 		return &Lease{mgr: m, e: e}, nil
 	}
-	if e.loaded {
+	if e.loaded.Load() {
 		// Defensive: the registry thinks the model is resident but the engine
 		// reports otherwise (a stale handle). Unload and fall through to a clean
 		// reload so the entry can never serve against a dead engine. Under
 		// normal operation this does not happen: the native engine waits for an
 		// aborted generation to unwind and keeps the handle valid.
 		_ = e.engine.Unload()
-		e.loaded = false
+		e.loaded.Store(false)
 		e.info = engine.ModelInfo{}
 	}
 
@@ -265,7 +278,8 @@ func (m *Manager) Acquire(ctx context.Context, id string) (*Lease, error) {
 		e.mu.Unlock()
 		return nil, fmt.Errorf("load model %s: %w", e.id, err)
 	}
-	e.loaded = true
+	e.loaded.Store(true)
+	m.recordWarm(e.id)
 	e.info = e.engine.Info()
 	if e.info.ID == "" {
 		e.info.ID = e.id
@@ -331,7 +345,7 @@ func (m *Manager) ensureCapacity(ctx context.Context, e *entry) error {
 func (m *Manager) residentCountLocked() int {
 	n := 0
 	for _, e := range m.entries {
-		if e.loaded {
+		if e.loaded.Load() {
 			n++
 		}
 	}
@@ -342,7 +356,7 @@ func (m *Manager) residentCountLocked() int {
 func (m *Manager) pickVictimLocked(e *entry) *entry {
 	var victim *entry
 	for _, cand := range m.entries {
-		if cand == e || !cand.loaded || cand.inUse || cand.evicting {
+		if cand == e || !cand.loaded.Load() || cand.inUse || cand.evicting {
 			continue
 		}
 		if victim == nil || cand.lastUsed.Before(victim.lastUsed) {
@@ -403,7 +417,7 @@ func (m *Manager) TryPromptTokens(id string, req engine.GenerateRequest) (prompt
 		return 0, 0, false
 	}
 	defer e.mu.Unlock()
-	if !e.loaded {
+	if !e.loaded.Load() {
 		return 0, 0, false
 	}
 

@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -306,5 +307,126 @@ func TestSlugify(t *testing.T) {
 		if got := slugify(in); got != want {
 			t.Errorf("slugify(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// TestPreloadIDs covers target selection for the startup warm-up: an explicit
+// preload_models list wins, preload:true selects the single registered model,
+// and neither selector configured yields no targets (lazy behavior).
+func TestPreloadIDs(t *testing.T) {
+	cfg := Default()
+	cfg.Models = []RegistryModel{{ID: "solo", Name: "Solo", File: "solo.gguf"}}
+	if got := cfg.PreloadIDs(); got != nil {
+		t.Fatalf("PreloadIDs() with preload disabled = %v, want nil", got)
+	}
+
+	cfg.Preload = true
+	if got := cfg.PreloadIDs(); len(got) != 1 || got[0] != "solo" {
+		t.Fatalf("PreloadIDs() with preload:true and one model = %v, want [solo]", got)
+	}
+
+	// An explicit list wins over preload:true and may name several models.
+	cfg.Models = []RegistryModel{{ID: "a"}, {ID: "b"}}
+	cfg.PreloadModels = []string{"b", "a"}
+	if got := cfg.PreloadIDs(); len(got) != 2 || got[0] != "b" || got[1] != "a" {
+		t.Fatalf("PreloadIDs() with an explicit list = %v, want [b a]", got)
+	}
+
+	// An empty list falls back to the preload selectors; with preload off there
+	// are no targets.
+	cfg.PreloadModels = []string{}
+	cfg.Preload = false
+	if got := cfg.PreloadIDs(); got != nil {
+		t.Fatalf("PreloadIDs() with an empty list and preload disabled = %v, want nil", got)
+	}
+}
+
+// TestValidatePreload covers the preload consistency checks: every named model
+// must exist, preload:true needs an unambiguous target, and a negative timeout
+// is rejected.
+func TestValidatePreload(t *testing.T) {
+	t.Run("unknown preload_models id", func(t *testing.T) {
+		cfg := Default()
+		cfg.Models = []RegistryModel{{ID: "alpha", File: "alpha.gguf"}}
+		cfg.PreloadModels = []string{"nope"}
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), `preload_models: unknown model id "nope"`) {
+			t.Fatalf("Validate() = %v, want an unknown model id error", err)
+		}
+	})
+
+	t.Run("preload several models without a list", func(t *testing.T) {
+		cfg := Default()
+		cfg.Models = []RegistryModel{{ID: "alpha", File: "alpha.gguf"}, {ID: "beta", File: "beta.gguf"}}
+		cfg.Preload = true
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "preload requires a single registered model or preload_models") {
+			t.Fatalf("Validate() = %v, want a preload target error", err)
+		}
+	})
+
+	t.Run("negative timeout", func(t *testing.T) {
+		cfg := Default()
+		cfg.Models = []RegistryModel{{ID: "alpha", File: "alpha.gguf"}}
+		cfg.PreloadTimeoutSec = -1
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("Validate() = nil, want a negative preload_timeout_sec error")
+		}
+	})
+
+	t.Run("valid explicit list for several models", func(t *testing.T) {
+		cfg := Default()
+		cfg.Models = []RegistryModel{{ID: "alpha", File: "alpha.gguf"}, {ID: "beta", File: "beta.gguf"}}
+		cfg.PreloadModels = []string{"alpha"}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate() = %v, want nil", err)
+		}
+	})
+}
+
+// TestPreloadTimeoutDefaultAndEnv verifies the warm-up budget default and its
+// environment overrides, including the preload toggle and target list.
+func TestPreloadTimeoutDefaultAndEnv(t *testing.T) {
+	cfg := Default()
+	if cfg.PreloadTimeoutSec != 300 {
+		t.Fatalf("default preload_timeout_sec = %d, want 300", cfg.PreloadTimeoutSec)
+	}
+
+	t.Setenv("TINYCODER_PRELOAD_TIMEOUT_SEC", "42")
+	t.Setenv("TINYCODER_PRELOAD", "true")
+	t.Setenv("TINYCODER_PRELOAD_MODELS", "alpha, beta")
+	if err := cfg.ApplyEnv(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PreloadTimeoutSec != 42 {
+		t.Fatalf("env preload_timeout_sec = %d, want 42", cfg.PreloadTimeoutSec)
+	}
+	if !cfg.Preload {
+		t.Fatal("env TINYCODER_PRELOAD=true did not set Preload")
+	}
+	if len(cfg.PreloadModels) != 2 || cfg.PreloadModels[0] != "alpha" || cfg.PreloadModels[1] != "beta" {
+		t.Fatalf("env TINYCODER_PRELOAD_MODELS = %v, want [alpha beta]", cfg.PreloadModels)
+	}
+}
+
+// TestExistingConfigWithoutPreloadKeysValidates verifies that a config written
+// before the preload keys existed keeps the defaults and still validates.
+func TestExistingConfigWithoutPreloadKeysValidates(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cfg.json")
+	body := `{"listen":":1234","models":[{"id":"solo","name":"Solo","file":"solo.gguf"}]}`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Preload || cfg.PreloadModels != nil || cfg.PreloadTimeoutSec != 300 {
+		t.Fatalf("preload defaults not applied: preload=%v preload_models=%v timeout=%d",
+			cfg.Preload, cfg.PreloadModels, cfg.PreloadTimeoutSec)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil for a pre-preload config", err)
 	}
 }

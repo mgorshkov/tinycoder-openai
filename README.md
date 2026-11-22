@@ -63,7 +63,7 @@ VBMI/VBMI2, Sapphire Rapids for AMX, alongside a matching
 
 See [`deploy/`](deploy/) for a systemd unit, an nginx reverse-proxy snippet
 (with SSE buffering disabled) and a Dockerfile. The server exposes `/healthz`
-for load-balancer health checks and streams SSE with
+for liveness and `/readyz` for readiness checks, and streams SSE with
 `X-Accel-Buffering: no` so nginx does not buffer token chunks.
 
 ### deploy.sh
@@ -129,6 +129,9 @@ to read the manifest; destination directories are created as needed.
 - **Lazy loading with LRU idle eviction**: models are loaded on first use and
   unloaded after an idle timeout; resident models are capped by
   `max_loaded_models`.
+- **Readiness and optional preload**: `/healthz` is liveness-only; `/readyz`
+  accounts for the optional startup warm-up (`preload` / `preload_models`), so
+  an orchestrator does not route traffic before the model is warm.
 - **Per-model request serialization**: the engine uses a single KV cache, so
   concurrent requests for the same model are queued. `max_concurrent_requests`
   defaults to one slot per registered model and bounds admission (queue depth);
@@ -151,18 +154,46 @@ to read the manifest; destination directories are created as needed.
 | `POST` | `/v1/messages` | Anthropic Messages API (streaming supported) |
 | `POST` | `/v1/generate` | Native endpoint (accepts `prompt` **or** `messages`) |
 | `GET`  | `/openai.json`, `/openai.yaml` | OpenAPI 3.1 document |
-| `GET`  | `/healthz` | Liveness probe |
+| `GET`  | `/healthz` | Liveness probe (process up) |
+| `GET`  | `/readyz` | Readiness probe (model warm-up) |
 
 The base URL is `https://api.tinycoder.dev/v1`, so all content endpoints live
 under the `/v1` prefix (e.g. `/v1/models`, `/v1/chat/completions`). Only these
 paths are served — there are no unversioned or legacy aliases.
 
-A prompt longer than the model's context window is refused with HTTP `400` and
-`{"error":{"type":"invalid_request_error","code":"context_length_exceeded"}}` on
-every generation endpoint. Streaming requests preflight the prompt only when the
-model is already resident and idle, so a cold or busy stream instead surfaces the
-same refusal as an SSE error event carrying the same code — not an empty success
-with `finish_reason: "stop"`.
+A prompt longer than the model's context window is refused with HTTP `400`. On
+the OpenAI-compatible endpoints (`/v1/completions`, `/v1/chat/completions`,
+`/v1/responses` and `/v1/generate`) the body is the OpenAI error shape,
+`{"error":{"type":"invalid_request_error","code":"context_length_exceeded"}}`.
+The Anthropic-shaped `POST /v1/messages` instead returns
+`{"type":"error","error":{"type":"invalid_request_error","message":"..."}}`,
+which carries no `code` field. Streaming requests preflight the prompt only when
+the model is already resident and idle, so a cold or busy stream surfaces the
+same refusal as an SSE `error` event (OpenAI-shaped on the OpenAI-compatible
+streams, Anthropic-shaped on `/v1/messages`) rather than an empty success with
+`finish_reason: "stop"`.
+
+### Health and readiness
+
+`/healthz` is a liveness probe: it returns `200` for as long as the process
+serves HTTP, regardless of whether any model is loaded. `/readyz` is the
+readiness probe and accounts for model loading, so an orchestrator should route
+traffic only once it returns `200`:
+
+| `status` | HTTP | Meaning |
+|----------|------|---------|
+| `ready` | `200` | Every configured preload target has been warmed at least once (or none is configured: the default lazy behavior is ready immediately). |
+| `loading` | `503` | The background warm-up is still running. |
+| `error` | `503` | A warm-up failed or exceeded `preload_timeout_sec`; the affected model entry carries the error message. |
+
+```json
+{"status":"ready","models":[{"id":"qwen3.6-35b-a3b","loaded":true}]}
+```
+
+Readiness is sticky on success: a later idle eviction does not flip a warmed
+process back to `503`. A failed warm-up stays reported until that model loads
+successfully — a lazy request that loads it clears the error. Both probes are
+unauthenticated.
 
 ### Quick start
 
@@ -298,7 +329,9 @@ Other environment variables: `TINYCODER_MAX_LOADED_MODELS`,
 `TINYCODER_REQUEST_TIMEOUT_SEC`, `TINYCODER_NO_TOKEN_TIMEOUT_SEC`,
 `TINYCODER_HARD_TIMEOUT_SEC`, `TINYCODER_MAX_CONCURRENT`,
 `TINYCODER_ALLOWED_ORIGINS` (comma-separated), `TINYCODER_API_KEYS`
-(comma-separated), `TINYCODER_TOOL_CALLING`, `TINYCODER_SCAN_MODELS_DIR`.
+(comma-separated), `TINYCODER_TOOL_CALLING`, `TINYCODER_SCAN_MODELS_DIR`,
+`TINYCODER_PRELOAD`, `TINYCODER_PRELOAD_MODELS` (comma-separated),
+`TINYCODER_PRELOAD_TIMEOUT_SEC`.
 
 `n_threads` (`TINYCODER_THREADS`) sizes each model's CPU worker pool — the
 engine gives every model its own, so `n_threads` on a `models[]` entry overrides
@@ -318,6 +351,26 @@ then **waits for the engine call to unwind** before releasing the model lock and
 concurrency slot. The loaded model (and its KV cache, which the engine clears on
 abort) is reused for the next request — the model is not unloaded, and the
 process cannot crash by racing a still-running engine.
+
+### Preload and readiness
+
+`preload` (bool, default `false`) warms the model at startup instead of on the
+first request, so an orchestrator can gate traffic on `/readyz`:
+
+- With a single entry in `"models"`, `"preload": true` is enough.
+- With several models, list the ids to warm in `"preload_models"` (it takes
+  precedence over `preload` when both are set). `preload: true` with several
+  models and no list is a startup validation error.
+- `preload_timeout_sec` (default `300`; `0` disables the bound) bounds one
+  model's warm-up by canceling its load context. A failed load (for example a
+  missing model file) reports `503 error` on `/readyz` instead of remaining
+  `loading`; an engine that ignores cancellation can still outlast the budget.
+- Targets are warmed sequentially in the background; startup and `/healthz` are
+  not delayed.
+
+The environment equivalents are `TINYCODER_PRELOAD`,
+`TINYCODER_PRELOAD_MODELS` (comma-separated) and
+`TINYCODER_PRELOAD_TIMEOUT_SEC`.
 
 ### Tool calling
 
@@ -384,7 +437,7 @@ forms; the first non-empty match wins:
 A missing or unknown key receives `401` with
 `{"error":{"type":"authentication_error","code":"invalid_api_key"}}`. When no
 keys are configured the endpoints are open (intended only for local use);
-`/healthz` is always unauthenticated for liveness probes.
+`/healthz` and `/readyz` are always unauthenticated for probes.
 
 See [`config.example.json`](config.example.json) for the full schema and the
 editable model registry. Registry entries map a public `id` to a `file`
