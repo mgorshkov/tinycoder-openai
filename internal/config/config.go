@@ -425,6 +425,42 @@ func (c Config) PreloadIDs() []string {
 	return nil
 }
 
+// ApplyModelFlags applies the one-model-per-process command-line flags. --model
+// resolves against the process working directory (like a shell path, not
+// against ModelsDir) and replaces the whole registry with that single entry;
+// --model-id overrides the id derived from the file name and --ctx sets the
+// entry's context window (0 means the engine default). --model-id and --ctx
+// without --model are errors.
+func (c *Config) ApplyModelFlags(model, modelID string, ctx int) error {
+	if model == "" {
+		if modelID != "" || ctx != 0 {
+			return fmt.Errorf("--model-id/--ctx require --model")
+		}
+		return nil
+	}
+	if ctx < 0 {
+		return fmt.Errorf("--ctx must be >= 0")
+	}
+	abs, err := filepath.Abs(model)
+	if err != nil {
+		return fmt.Errorf("resolve --model %q: %w", model, err)
+	}
+	base := strings.TrimSuffix(filepath.Base(abs), filepath.Ext(abs))
+	if modelID == "" {
+		modelID = slugify(base)
+	}
+	// Replace the registry rather than mutating one entry: fields the flags do
+	// not set (architecture, quantization, n_threads, ...) must stay zero and
+	// never be inherited from a config-file model.
+	c.Models = []RegistryModel{{
+		ID:            modelID,
+		Name:          base,
+		File:          abs,
+		ContextLength: ctx,
+	}}
+	return nil
+}
+
 // ResolveModelPath returns the absolute GGUF path for a registry entry. A file
 // field that is already absolute is returned as-is; otherwise it is joined to
 // ModelsDir.

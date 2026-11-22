@@ -37,6 +37,9 @@ func run() error {
 		listen     = flag.String("listen", "", "listen address (overrides config), e.g. :8080")
 		modelsDir  = flag.String("models-dir", "", "directory containing GGUF models (overrides config)")
 		logLevel   = flag.String("log-level", "", "log level: debug|info|warn|error (overrides config)")
+		model      = flag.String("model", "", "one-model mode: model file path (replaces the config models list)")
+		modelID    = flag.String("model-id", "", "one-model mode: served model id (defaults to the file name)")
+		ctxLen     = flag.Int("ctx", 0, "one-model mode: context length (0 = engine default)")
 		showVer    = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
@@ -61,6 +64,11 @@ func run() error {
 	}
 	if *logLevel != "" {
 		cfg.LogLevel = *logLevel
+	}
+	// One-model-per-process mode (like llama-server). These flags win over the
+	// config file's registry: --model replaces the whole "models" list.
+	if err := cfg.ApplyModelFlags(*model, *modelID, *ctxLen); err != nil {
+		return err
 	}
 	// The config file is the authoritative registry: /v1/models advertises only
 	// the models declared under "models", which replace the built-in list. Models
