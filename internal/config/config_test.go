@@ -310,6 +310,172 @@ func TestSlugify(t *testing.T) {
 	}
 }
 
+// TestApplyModelFlagsDerivesID verifies that --model alone yields a one-entry
+// registry whose id is slugified from the file base name (without extension)
+// and whose name keeps the original base name.
+func TestApplyModelFlagsDerivesID(t *testing.T) {
+	cfg := Default()
+	if err := cfg.ApplyModelFlags("/x/Ternary-Bonsai-2-27B-PQ2_0.gguf", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Models) != 1 {
+		t.Fatalf("len(models) = %d, want 1: %+v", len(cfg.Models), cfg.Models)
+	}
+	m := cfg.Models[0]
+	if m.ID != "ternary-bonsai-2-27b-pq2-0" {
+		t.Fatalf("derived id = %q, want %q", m.ID, "ternary-bonsai-2-27b-pq2-0")
+	}
+	if m.Name != "Ternary-Bonsai-2-27B-PQ2_0" {
+		t.Fatalf("name = %q, want %q", m.Name, "Ternary-Bonsai-2-27B-PQ2_0")
+	}
+	if m.File != "/x/Ternary-Bonsai-2-27B-PQ2_0.gguf" {
+		t.Fatalf("file = %q, want the absolute path unchanged", m.File)
+	}
+	if m.ContextLength != 0 {
+		t.Fatalf("context_length = %d, want 0 (unset -> engine default)", m.ContextLength)
+	}
+}
+
+// TestApplyModelFlagsExplicitID verifies that --model-id and --ctx are
+// forwarded into the single generated registry entry.
+func TestApplyModelFlagsExplicitID(t *testing.T) {
+	cfg := Default()
+	path := "/data/models/gemma/gemma4-coding-Q2_K.gguf"
+	if err := cfg.ApplyModelFlags(path, "solo", 4096); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Models) != 1 {
+		t.Fatalf("len(models) = %d, want 1: %+v", len(cfg.Models), cfg.Models)
+	}
+	m := cfg.Models[0]
+	if m.ID != "solo" {
+		t.Fatalf("id = %q, want %q", m.ID, "solo")
+	}
+	if m.Name != "gemma4-coding-Q2_K" {
+		t.Fatalf("name = %q, want %q", m.Name, "gemma4-coding-Q2_K")
+	}
+	if m.File != path {
+		t.Fatalf("file = %q, want %q", m.File, path)
+	}
+	if m.ContextLength != 4096 {
+		t.Fatalf("context_length = %d, want 4096", m.ContextLength)
+	}
+}
+
+// TestApplyModelFlagsRelativePathMadeAbsolute verifies that a relative --model
+// is resolved against the process working directory (filepath.Abs), never
+// against models_dir.
+func TestApplyModelFlagsRelativePathMadeAbsolute(t *testing.T) {
+	cfg := Default()
+	cfg.ModelsDir = "/somewhere/else"
+	rel := filepath.Join("scratch", "rel-model.gguf")
+	if err := cfg.ApplyModelFlags(rel, "", 0); err != nil {
+		t.Fatal(err)
+	}
+	want, err := filepath.Abs(rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := cfg.Models[0].File
+	if got != want {
+		t.Fatalf("file = %q, want %q (absolute, resolved against the working directory)", got, want)
+	}
+	if !filepath.IsAbs(got) {
+		t.Fatalf("file = %q, want an absolute path", got)
+	}
+	if strings.HasPrefix(got, cfg.ModelsDir) {
+		t.Fatalf("file = %q, must not be resolved against models_dir %q", got, cfg.ModelsDir)
+	}
+}
+
+// TestApplyModelFlagsErrors covers the flag validation errors: --model-id and
+// --ctx are meaningless without --model, and a negative --ctx is invalid.
+func TestApplyModelFlagsErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		model   string
+		modelID string
+		ctx     int
+		wantErr string
+	}{
+		{name: "model-id without model", modelID: "solo", wantErr: "--model-id/--ctx require --model"},
+		{name: "ctx without model", ctx: 4096, wantErr: "--model-id/--ctx require --model"},
+		{name: "negative ctx", model: "/x/m.gguf", ctx: -1, wantErr: "--ctx must be >= 0"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Default()
+			before := len(cfg.Models)
+			err := cfg.ApplyModelFlags(tc.model, tc.modelID, tc.ctx)
+			if err == nil {
+				t.Fatalf("ApplyModelFlags(%q, %q, %d) = nil, want an error containing %q",
+					tc.model, tc.modelID, tc.ctx, tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error = %q, want it to contain %q", err, tc.wantErr)
+			}
+			if len(cfg.Models) != before {
+				t.Fatalf("a failed call changed the registry: len = %d, want %d", len(cfg.Models), before)
+			}
+		})
+	}
+}
+
+// TestApplyModelFlagsNoModelIsNoop verifies that no model flag at all leaves the
+// configuration untouched.
+func TestApplyModelFlagsNoModelIsNoop(t *testing.T) {
+	cfg := Default()
+	before := append([]RegistryModel(nil), cfg.Models...)
+	if err := cfg.ApplyModelFlags("", "", 0); err != nil {
+		t.Fatalf("ApplyModelFlags(\"\", \"\", 0) = %v, want nil", err)
+	}
+	if len(cfg.Models) != len(before) {
+		t.Fatalf("len(models) = %d, want %d", len(cfg.Models), len(before))
+	}
+	for i := range before {
+		if cfg.Models[i] != before[i] {
+			t.Fatalf("models[%d] = %+v, want the unchanged built-in %+v", i, cfg.Models[i], before[i])
+		}
+	}
+}
+
+// TestApplyModelFlagsReplacesRegistry verifies that --model replaces the whole
+// registry with exactly one entry and that fields the flags omit stay zero,
+// even when the config file's model carries architecture/quantization/etc.
+func TestApplyModelFlagsReplacesRegistry(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cfg.json")
+	body := `{"listen":"127.0.0.1:9999","models":[` +
+		`{"id":"from-file","name":"From File","file":"from-file.gguf","architecture":"qwen2",` +
+		`"quantization":"Q4_K_M","context_length":8192,"n_threads":7,"size_bytes":123,` +
+		`"description":"file description"}]}`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.ApplyModelFlags("/models/solo.gguf", "solo", 4096); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Models) != 1 {
+		t.Fatalf("len(models) = %d, want exactly 1: %+v", len(cfg.Models), cfg.Models)
+	}
+	m := cfg.Models[0]
+	if m.ID != "solo" || m.Name != "solo" || m.File != "/models/solo.gguf" || m.ContextLength != 4096 {
+		t.Fatalf("entry = %+v, want {ID:solo Name:solo File:/models/solo.gguf ContextLength:4096}", m)
+	}
+	if m.Architecture != "" || m.Quantization != "" || m.NThreads != 0 ||
+		m.SizeBytes != 0 || m.Description != "" {
+		t.Fatalf("file-model fields leaked into the flag registry: %+v", m)
+	}
+	// Non-registry configuration is untouched by model flags.
+	if cfg.Listen != "127.0.0.1:9999" {
+		t.Fatalf("listen = %q, want 127.0.0.1:9999", cfg.Listen)
+	}
+}
+
 // TestPreloadIDs covers target selection for the startup warm-up: an explicit
 // preload_models list wins, preload:true selects the single registered model,
 // and neither selector configured yields no targets (lazy behavior).
