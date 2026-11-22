@@ -75,10 +75,16 @@ type GenerateRequest struct {
 	RepeatLastN   int
 	Seed          uint32
 
-	// NoTokenTimeout aborts generation when no token has been emitted for this
-	// long (0 disables). The manager populates it from configuration; native
-	// engines check it on the request thread while the C++ worker runs.
+	// NoTokenTimeout bounds engine inactivity: generation is aborted when
+	// neither a token has been emitted nor prefill progress reported for this
+	// long (0 disables). The manager populates it from configuration and also
+	// enforces it itself, resetting the clock on tokens and on OnProgress;
+	// native engines additionally treat each abort-predicate poll as activity.
 	NoTokenTimeout time.Duration
+	// OnProgress, when non-nil, is called from the engine's worker thread when
+	// it makes progress without emitting a token (a long prefill). It must be
+	// cheap and non-blocking, and safe to call concurrently with onToken.
+	OnProgress ProgressFunc
 	// HardTimeout bounds the total wall-clock time of one Generate call
 	// (0 disables). When exceeded the engine worker is abandoned and the call
 	// returns ErrContextCanceled, so the concurrency slot and the model lock
@@ -109,6 +115,11 @@ type GenerateResult struct {
 // TokenFunc is invoked for every generated token. Returning false requests an
 // early stop; the engine then unwinds cleanly.
 type TokenFunc func(Token) bool
+
+// ProgressFunc reports engine progress that has not produced a token yet (a
+// long prefill). It must be cheap and non-blocking, and safe to call
+// concurrently with onToken from the engine's own threads.
+type ProgressFunc func()
 
 // AbortFunc is a cheap, non-blocking predicate the engine polls between
 // per-layer / per-block units of work (and between tokens). Returning true

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mgorshkov/tinycoder-openai/internal/config"
@@ -393,5 +394,65 @@ func (m *Manager) Generate(ctx context.Context, id string, req engine.GenerateRe
 
 	m.exec.Lock()
 	defer m.exec.Unlock()
-	return lease.Model().Generate(ctx, req, onToken)
+
+	if req.NoTokenTimeout <= 0 {
+		return lease.Model().Generate(ctx, req, onToken)
+	}
+
+	// Per-request inactivity watchdog. It cancels the generation when neither a
+	// token nor an engine prefill-progress event arrives within NoTokenTimeout,
+	// and is started only after Acquire, so a cold model load (which can take
+	// minutes) never counts as inactivity.
+	var last atomic.Int64
+	last.Store(time.Now().UnixNano())
+	prevProgress := req.OnProgress
+	note := func() {
+		last.Store(time.Now().UnixNano())
+		if prevProgress != nil {
+			prevProgress()
+		}
+	}
+	// Engine prefill progress counts as activity exactly like a token does.
+	req.OnProgress = note
+	wrapped := func(t engine.Token) bool {
+		note()
+		if onToken == nil {
+			return true
+		}
+		return onToken(t)
+	}
+	onToken = wrapped
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var tripped atomic.Bool
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		iv := req.NoTokenTimeout / 4
+		if iv < 5*time.Millisecond {
+			iv = 5 * time.Millisecond
+		}
+		if iv > time.Second {
+			iv = time.Second
+		}
+		tick := time.NewTicker(iv)
+		defer tick.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-tick.C:
+				if time.Since(time.Unix(0, last.Load())) > req.NoTokenTimeout {
+					tripped.Store(true)
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	usage, err := lease.Model().Generate(ctx, req, onToken)
+	if tripped.Load() {
+		return usage, engine.ErrNoToken
+	}
+	return usage, err
 }

@@ -297,10 +297,13 @@ Other environment variables: `TINYCODER_MAX_LOADED_MODELS`,
 engine gives every model its own, so `n_threads` on a `models[]` entry overrides
 the global value for that model (useful for running a small model on a few
 threads beside a large one). `0` uses every logical CPU. `no_token_timeout_sec`
-aborts a generation that emits no token for that long (a hung load/prefill guard;
-reported to the client as `504` with code `no_token`). `hard_timeout_sec` bounds
-the total wall-clock time of one generation (reported as `504` with code
-`timeout`).
+aborts a generation when neither a token nor an engine prefill-progress event
+arrives for that long (a hung-engine guard; reported to the client as `504` with
+code `no_token`). It defaults to `0` (disabled), because a full-GPU prefill emits
+no gateway-observable progress at all, so no fixed window can distinguish a
+multi-minute prefill from a hung engine; set it explicitly to get the fast-fail
+back. `hard_timeout_sec` bounds the total wall-clock time of one generation
+(reported as `504` with code `timeout`).
 
 Aborts are cooperative and safe: on timeout, client disconnect or the no-token
 guard, the server signals the engine's per-layer / per-block abort predicate and
@@ -406,9 +409,12 @@ served registry.
   this ceiling (not rejected), so OpenAI-compatible clients that request large
   output budgets — e.g. Roo Code, which clamps to 20% of the model's declared
   context window — still succeed. `request_timeout_sec` bounds every generation
-  and cancels it on client disconnect. `no_token_timeout_sec` guards against a
-  hung engine that has produced no token, and `hard_timeout_sec` is a
-  last-resort wall-clock kill that abandons an overrunning engine worker.
+  and cancels it on client disconnect. `no_token_timeout_sec` (default `0`,
+  disabled) guards against a hung engine: it aborts when neither a token nor a
+  prefill-progress event arrives within the window, so a long prefill is not
+  mistaken for a hang. `hard_timeout_sec` is the last-resort wall-clock kill that
+  abandons an overrunning engine worker. Even with the no-token guard disabled,
+  `request_timeout_sec` and `hard_timeout_sec` bound every request.
 - Cancellation is cooperative across the C ABI: an abort predicate is polled
   inside the engine's per-layer / per-block loop, not only at the token
   callback, so a stuck prefill can be interrupted. Timeouts and cancellation are

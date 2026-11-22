@@ -20,8 +20,9 @@ import (
 // C abort predicate via a cgo.Handle (an integer), which avoids passing Go
 // pointers into C.
 type genCtx struct {
-	ctx     context.Context
-	onToken engine.TokenFunc
+	ctx        context.Context
+	onToken    engine.TokenFunc
+	onProgress engine.ProgressFunc
 
 	// canceled/stopped/noToken are read+written on the engine thread(s)
 	// (callback and abort predicate) and read on the request goroutine after
@@ -36,9 +37,10 @@ type genCtx struct {
 	stopped  atomic.Bool
 	noToken  atomic.Bool
 
-	// lastActivity is the UnixNano of the last token (or generation start),
-	// refreshed from the callback. noTokenTimeout bounds the idle window while
-	// the engine is running; hardDeadline bounds the whole call.
+	// lastActivity is the UnixNano of the last token, prefill-progress event
+	// (or generation start), refreshed from the token callback and the abort
+	// predicate. noTokenTimeout bounds the idle window while the engine is
+	// running; hardDeadline bounds the whole call.
 	lastActivity   atomic.Int64
 	noTokenTimeout time.Duration
 	hardDeadline   time.Time
@@ -49,9 +51,14 @@ type genCtx struct {
 }
 
 // newGenCtx builds the per-call state, seeding the activity clock so a hung
-// prefill (which emits no token) is still bounded by noTokenTimeout.
+// engine is still bounded by noTokenTimeout.
 func newGenCtx(ctx context.Context, onToken engine.TokenFunc, req engine.GenerateRequest) *genCtx {
-	gc := &genCtx{ctx: ctx, onToken: onToken, noTokenTimeout: req.NoTokenTimeout}
+	gc := &genCtx{
+		ctx:            ctx,
+		onToken:        onToken,
+		onProgress:     req.OnProgress,
+		noTokenTimeout: req.NoTokenTimeout,
+	}
 	gc.lastActivity.Store(time.Now().UnixNano())
 	if req.HardTimeout > 0 {
 		gc.hardDeadline = time.Now().Add(req.HardTimeout)
@@ -59,11 +66,37 @@ func newGenCtx(ctx context.Context, onToken engine.TokenFunc, req engine.Generat
 	return gc
 }
 
+// noteProgress refreshes the idle clock; onProgress runs outside any lock.
+func (gc *genCtx) noteProgress() {
+	gc.lastActivity.Store(time.Now().UnixNano())
+	if gc.onProgress != nil {
+		gc.onProgress()
+	}
+}
+
+// noTokenExpired reports whether the inactivity window has elapsed. A zero
+// timeout disables the guard, and a genCtx that never recorded activity cannot
+// expire (the clock is seeded when generation starts).
+func (gc *genCtx) noTokenExpired(now time.Time) bool {
+	if gc.noTokenTimeout <= 0 {
+		return false
+	}
+	last := gc.lastActivity.Load()
+	if last <= 0 {
+		return false
+	}
+	return now.Sub(time.Unix(0, last)) > gc.noTokenTimeout
+}
+
 // shouldAbort is the cooperative abort predicate handed to the C engine. It is
 // polled inside the engine's per-layer / per-block loop (not only per token).
 //
 // It returns true when the request context is done, the total wall-clock
 // deadline has passed, or no token has been produced within noTokenTimeout.
+//
+// A poll proves the engine is alive: it is polled between per-layer / per-block
+// units of work during CPU prefill and partial-offload prefill, so each poll is
+// treated as prefill progress and keeps the request alive.
 //
 //export tcGoAbortPredicate
 func tcGoAbortPredicate(user C.uintptr_t) C.int {
@@ -80,20 +113,20 @@ func tcGoAbortPredicate(user C.uintptr_t) C.int {
 		default:
 		}
 	}
+	// Refresh the idle clock (and forward the progress event) before the
+	// timeout check, so a live engine cannot trip the no-token guard.
+	gc.noteProgress()
 	now := time.Now()
 	if !gc.hardDeadline.IsZero() && now.After(gc.hardDeadline) {
 		gc.canceled.Store(true)
 		return 1
 	}
-	if gc.noTokenTimeout > 0 {
-		last := gc.lastActivity.Load()
-		if last > 0 && now.Sub(time.Unix(0, last)) > gc.noTokenTimeout {
-			// Record that the no-token guard (not a client disconnect) tripped,
-			// so the caller can return engine.ErrNoToken and the HTTP layer can
-			// surface code "no_token" rather than a generic error.
-			gc.noToken.Store(true)
-			return 1
-		}
+	if gc.noTokenExpired(now) {
+		// Record that the no-token guard (not a client disconnect) tripped,
+		// so the caller can return engine.ErrNoToken and the HTTP layer can
+		// surface code "no_token" rather than a generic error.
+		gc.noToken.Store(true)
+		return 1
 	}
 	return 0
 }
@@ -105,8 +138,8 @@ func tcGoTokenCallback(user C.uintptr_t, tokenID C.int32_t, text *C.char) C.int 
 	if !ok || gc == nil {
 		return 1
 	}
-	// A token is activity: refresh the idle clock, count it, and honor context
-	// cancellation.
+	// A token is already progress: refresh the idle clock and count it, but do
+	// not call onProgress (the manager wraps onToken itself).
 	gc.lastActivity.Store(time.Now().UnixNano())
 	gc.tokens.Add(1)
 	if gc.ctx != nil {
