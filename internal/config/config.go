@@ -55,10 +55,18 @@ type Config struct {
 	// HardTimeoutSec bounds the total wall-clock time of one generation; when
 	// exceeded the engine worker is abandoned and the request fails, so the
 	// concurrency slot is released. 0 disables.
-	HardTimeoutSec int             `json:"hard_timeout_sec"`
-	MaxConcurrent  int             `json:"max_concurrent_requests"`
-	LogLevel       string          `json:"log_level"`
-	Models         []RegistryModel `json:"models"`
+	HardTimeoutSec int `json:"hard_timeout_sec"`
+	MaxConcurrent  int `json:"max_concurrent_requests"`
+	// Preload warms the registry at startup instead of on the first request.
+	// With several registered models it requires preload_models.
+	Preload bool `json:"preload"`
+	// PreloadModels lists the model ids to warm at startup (takes precedence
+	// over Preload when both are set).
+	PreloadModels []string `json:"preload_models"`
+	// PreloadTimeoutSec bounds one model's warm-up (0 disables the bound).
+	PreloadTimeoutSec int             `json:"preload_timeout_sec"`
+	LogLevel          string          `json:"log_level"`
+	Models            []RegistryModel `json:"models"`
 }
 
 // Default returns a configuration with sensible production defaults and a
@@ -92,8 +100,12 @@ func Default() Config {
 		// wait for a model, not how many run; set it explicitly to change the
 		// queue depth.
 		MaxConcurrent: 0,
-		LogLevel:      "info",
-		Models:        builtinModels(),
+		// Warm-up is opt-in; the budget bounds one model's load so a broken or
+		// huge model cannot leave readiness stuck in "loading" forever.
+		Preload:           false,
+		PreloadTimeoutSec: 300,
+		LogLevel:          "info",
+		Models:            builtinModels(),
 	}
 }
 
@@ -300,6 +312,15 @@ func (c *Config) ApplyEnv() error {
 	if err := envInt("TINYCODER_MAX_CONCURRENT", &c.MaxConcurrent); err != nil {
 		return err
 	}
+	if v := os.Getenv("TINYCODER_PRELOAD_MODELS"); v != "" {
+		c.PreloadModels = splitCSV(v)
+	}
+	if err := envInt("TINYCODER_PRELOAD_TIMEOUT_SEC", &c.PreloadTimeoutSec); err != nil {
+		return err
+	}
+	if err := envBool("TINYCODER_PRELOAD", &c.Preload); err != nil {
+		return err
+	}
 	if err := envBool("TINYCODER_SCAN_MODELS_DIR", &c.ScanModelsDir); err != nil {
 		return err
 	}
@@ -343,6 +364,17 @@ func (c *Config) Validate() error {
 		}
 		seen[m.ID] = true
 	}
+	if c.PreloadTimeoutSec < 0 {
+		return fmt.Errorf("preload_timeout_sec must be >= 0")
+	}
+	for _, id := range c.PreloadModels {
+		if !seen[id] {
+			return fmt.Errorf("preload_models: unknown model id %q", id)
+		}
+	}
+	if c.Preload && len(c.PreloadModels) == 0 && len(c.Models) != 1 {
+		return fmt.Errorf("preload requires a single registered model or preload_models")
+	}
 	return nil
 }
 
@@ -378,6 +410,19 @@ func (c Config) NoTokenTimeout() time.Duration {
 // (0 disables).
 func (c Config) HardRequestTimeout() time.Duration {
 	return time.Duration(c.HardTimeoutSec) * time.Second
+}
+
+// PreloadIDs resolves the model ids the startup warm-up should load:
+// preload_models when non-empty, else the single registered model when preload
+// is true, else no targets (the default lazy-load behavior).
+func (c Config) PreloadIDs() []string {
+	if len(c.PreloadModels) > 0 {
+		return c.PreloadModels
+	}
+	if c.Preload && len(c.Models) == 1 {
+		return []string{c.Models[0].ID}
+	}
+	return nil
 }
 
 // ResolveModelPath returns the absolute GGUF path for a registry entry. A file

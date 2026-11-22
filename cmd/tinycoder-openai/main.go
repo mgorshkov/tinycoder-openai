@@ -85,11 +85,14 @@ func run() error {
 	mgr.Start()
 	defer mgr.Stop()
 
-	handler := server.New(cfg, mgr, log).Handler()
+	srv := server.New(cfg, mgr, log)
+	// Warm the configured models in the background. This must not block startup:
+	// the listener comes up first and /readyz reports the warm-up progress.
+	srv.StartPreload()
 
 	httpSrv := &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           handler,
+		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 15 * time.Second,
 		// No ReadTimeout: request bodies are small but streaming responses can
 		// be long-lived. IdleTimeout bounds keep-alive connections.
