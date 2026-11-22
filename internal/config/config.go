@@ -445,9 +445,15 @@ func (c *Config) ApplyModelFlags(model, modelID string, ctx int) error {
 	if err != nil {
 		return fmt.Errorf("resolve --model %q: %w", model, err)
 	}
-	base := strings.TrimSuffix(filepath.Base(abs), filepath.Ext(abs))
+	base := modelFileStem(filepath.Base(abs))
+	if base == "" {
+		return fmt.Errorf("--model: cannot derive a model id from %q; pass --model-id", model)
+	}
 	if modelID == "" {
 		modelID = slugify(base)
+	}
+	if modelID == "" {
+		return fmt.Errorf("--model: cannot derive a model id from %q; pass --model-id", model)
 	}
 	// Replace the registry rather than mutating one entry: fields the flags do
 	// not set (architecture, quantization, n_threads, ...) must stay zero and
@@ -459,6 +465,19 @@ func (c *Config) ApplyModelFlags(model, modelID string, ctx int) error {
 		ContextLength: ctx,
 	}}
 	return nil
+}
+
+// modelFileStem returns base with only a case-insensitive ".gguf" extension
+// stripped. Any other dotted suffix is part of the model identity: a
+// checkpoint directory such as qwen3.8-27B-exl3-1.60bpw (or a plain stem like
+// qwen2.5-coder) must keep its full name, because trimming the last dot-suffix
+// would silently drop the quantization/bit width and advertise the wrong model.
+func modelFileStem(base string) string {
+	const ext = ".gguf"
+	if len(base) >= len(ext) && strings.EqualFold(base[len(base)-len(ext):], ext) {
+		return base[:len(base)-len(ext)]
+	}
+	return base
 }
 
 // ResolveModelPath returns the absolute GGUF path for a registry entry. A file
