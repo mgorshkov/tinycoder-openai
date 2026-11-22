@@ -151,10 +151,15 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, chatRe
 		return
 	}
 
+	// One request context bounds the whole request: the prompt-window
+	// preflight, any model load, and generation (including streaming).
+	ctx, cancel := s.requestContext(r)
+	defer cancel()
+
 	// Reject a prompt that cannot fit the model's window before opening any
 	// stream. Streaming requests are only preflighted when the model is already
-	// warm (see checkContextWindow): a cold stream opens immediately, as before.
-	if err := s.checkContextWindow(r, modelID, genReq, req.Stream); err != nil {
+	// warm and idle; a cold or busy stream opens immediately, as before.
+	if err := s.checkContextWindow(ctx, modelID, genReq, req.Stream); err != nil {
 		s.writeGenerateError(w, err)
 		return
 	}
@@ -162,15 +167,12 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, chatRe
 	includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
 	if req.Stream {
 		if isChat {
-			s.streamChat(w, r, modelID, genReq, includeUsage, parseTools)
+			s.streamChat(w, ctx, modelID, genReq, includeUsage, parseTools)
 		} else {
-			s.streamCompletion(w, r, modelID, genReq, includeUsage)
+			s.streamCompletion(w, ctx, modelID, genReq, includeUsage)
 		}
 		return
 	}
-
-	ctx, cancel := s.requestContext(r)
-	defer cancel()
 
 	var b strings.Builder
 	usage, err := s.mgr.Generate(ctx, modelID, genReq, func(t engine.Token) bool {
@@ -336,28 +338,38 @@ func (s *Server) buildRequest(req generationRequest, chatRequired bool, toolInst
 // checkContextWindow is the shared prompt-window preflight for every generation
 // endpoint.
 //
-// Non-streaming requests always preflight: the model may be loaded here, and an
-// over-long prompt is an HTTP 400 written before anything else. Streaming
-// requests preflight only when the model is already resident (warm), so a warm
-// over-long prompt still gets a clean 400 before any SSE header. A cold
-// streaming request skips the check and opens the stream immediately (role
-// chunk + keep-alives), preserving the no-silent-load guarantee; an over-long
-// prompt then surfaces through the engine-refusal fallback as an SSE error
-// event carrying code "context_length_exceeded" instead of an empty success.
+// Non-streaming requests always preflight through the blocking PromptTokens,
+// which may load the model: an over-long prompt is an HTTP 400 written before
+// anything else.
 //
-// It is best-effort: a failure to determine the prompt size (tokenizer
-// unavailable, model load error) returns nil, leaving generation to surface the
-// error as it did before.
-func (s *Server) checkContextWindow(r *http.Request, modelID string, genReq engine.GenerateRequest, streaming bool) error {
-	if streaming && !s.mgr.IsLoaded(modelID) {
-		return nil
-	}
-	ctx, cancel := s.requestContext(r)
-	defer cancel()
-
-	tokens, window, err := s.mgr.PromptTokens(ctx, modelID, genReq)
-	if err != nil {
-		return nil
+// Streaming requests use the non-blocking TryPromptTokens and skip the check
+// when it cannot run (model cold, busy, evicted, or untokenizable). This is what
+// keeps a second streaming client from waiting behind the first generation
+// before its SSE headers are written. A streaming check that does run is still
+// authoritative for a warm, idle model, so a warm over-long prompt gets a clean
+// 400 before any SSE header. A skipped check leaves an over-long prompt to the
+// engine-refusal fallback, which surfaces as an SSE error event carrying code
+// "context_length_exceeded" instead of an empty success.
+//
+// The preflight is best-effort: a failure to determine the prompt size
+// (tokenizer unavailable, model load error) returns nil, leaving generation to
+// surface the error as it did before.
+func (s *Server) checkContextWindow(ctx context.Context, modelID string, genReq engine.GenerateRequest, streaming bool) error {
+	var (
+		tokens, window int
+		ok             bool
+	)
+	if streaming {
+		tokens, window, ok = s.mgr.TryPromptTokens(modelID, genReq)
+		if !ok {
+			return nil
+		}
+	} else {
+		var err error
+		tokens, window, err = s.mgr.PromptTokens(ctx, modelID, genReq)
+		if err != nil {
+			return nil
+		}
 	}
 	if window > 0 && tokens > window {
 		return fmt.Errorf("%w: prompt is too long: %d tokens > %d maximum", engine.ErrContextLength, tokens, window)
@@ -400,7 +412,7 @@ func (s *Server) writeGenerateError(w http.ResponseWriter, err error) {
 
 // ---- streaming ----
 
-func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, modelID string, req engine.GenerateRequest, includeUsage bool) {
+func (s *Server) streamCompletion(w http.ResponseWriter, ctx context.Context, modelID string, req engine.GenerateRequest, includeUsage bool) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "streaming unsupported", "server_error", "")
@@ -417,7 +429,7 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, modelI
 		"choices": []map[string]any{{"index": 0, "text": "", "finish_reason": nil}},
 	})
 
-	usage, genErr := s.runStream(w, r, modelID, req, func(text string) {
+	usage, genErr := s.runStream(ctx, modelID, req, func(text string) {
 		sw.write(completionChunk{
 			ID: id, Object: "text_completion", Created: nowUnix(), Model: modelID,
 			Choices: []completionChoice{{Index: 0, Text: text, FinishReason: ""}},
@@ -446,7 +458,7 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, modelI
 	sw.writeDone()
 }
 
-func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, modelID string, req engine.GenerateRequest, includeUsage, parseTools bool) {
+func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, modelID string, req engine.GenerateRequest, includeUsage, parseTools bool) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "streaming unsupported", "server_error", "")
@@ -468,7 +480,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, modelID stri
 		emitted  int
 		callSeen bool
 	)
-	usage, genErr := s.runStream(w, r, modelID, req, func(text string) {
+	usage, genErr := s.runStream(ctx, modelID, req, func(text string) {
 		acc.WriteString(text)
 		if !parseTools {
 			sw.write(chatChunk{
@@ -590,12 +602,11 @@ func safeContentLen(full string) int {
 }
 
 // runStream executes generation, forwarding each token through emit and
-// returning aggregate usage plus any terminal error. If the client disconnects,
-// the context is canceled and generation stops; the error is logged and returned
-// so the caller can terminate the SSE stream instead of hanging.
-func (s *Server) runStream(w http.ResponseWriter, r *http.Request, modelID string, req engine.GenerateRequest, emit func(string)) (engine.Usage, error) {
-	ctx, cancel := s.requestContext(r)
-	defer cancel()
+// returning aggregate usage plus any terminal error. It runs on the caller's
+// single request context: if the client disconnects or the request deadline
+// expires, that context is canceled and generation stops; the error is logged
+// and returned so the caller can terminate the SSE stream instead of hanging.
+func (s *Server) runStream(ctx context.Context, modelID string, req engine.GenerateRequest, emit func(string)) (engine.Usage, error) {
 	usage, err := s.mgr.Generate(ctx, modelID, req, func(t engine.Token) bool {
 		emit(t.Text)
 		return true

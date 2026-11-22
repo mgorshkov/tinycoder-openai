@@ -92,7 +92,8 @@ func (gc *genCtx) noTokenExpired(now time.Time) bool {
 // polled inside the engine's per-layer / per-block loop (not only per token).
 //
 // It returns true when the request context is done, the total wall-clock
-// deadline has passed, or no token has been produced within noTokenTimeout.
+// deadline has passed, or no token or progress has been produced within
+// noTokenTimeout.
 //
 // A poll proves the engine is alive: it is polled between per-layer / per-block
 // units of work during CPU prefill and partial-offload prefill, so each poll is
@@ -100,7 +101,12 @@ func (gc *genCtx) noTokenExpired(now time.Time) bool {
 //
 //export tcGoAbortPredicate
 func tcGoAbortPredicate(user C.uintptr_t) C.int {
-	h := cgo.Handle(uintptr(user))
+	return C.int(abortPredicate(cgo.Handle(uintptr(user))))
+}
+
+// abortPredicate is the Go body of tcGoAbortPredicate, split out so tests can
+// drive it with a cgo.Handle (Go does not support cgo in test files).
+func abortPredicate(h cgo.Handle) int {
 	gc, ok := h.Value().(*genCtx)
 	if !ok || gc == nil {
 		return 0

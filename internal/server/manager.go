@@ -376,15 +376,7 @@ func (m *Manager) PromptTokens(ctx context.Context, id string, req engine.Genera
 	}
 	defer lease.Release()
 
-	window = lease.Info().ContextLength
-	if window == 0 {
-		if rm, ok := m.ModelByID(id); ok {
-			window = rm.ContextLength
-		}
-	}
-	if window == 0 {
-		window = m.cfg.MaxSeqLen
-	}
+	window = m.effectiveWindow(id, lease.Info())
 
 	promptTokens, err = lease.Model().CountPromptTokens(req)
 	if err != nil {
@@ -393,14 +385,61 @@ func (m *Manager) PromptTokens(ctx context.Context, id string, req engine.Genera
 	return promptTokens, window, nil
 }
 
+// TryPromptTokens is the non-blocking variant of PromptTokens used by the
+// streaming preflight. It never waits for a busy model and never loads one: it
+// only takes the entry lock when it is free and reports ok=false when the model
+// is not resident, another request holds the lock (generating, loading or
+// unloading), or the prompt cannot be counted. A false result therefore means
+// "skip the check", which also closes the warm-then-evict race: a model that
+// leaves residency between IsLoaded and here is simply not preflighted.
+func (m *Manager) TryPromptTokens(id string, req engine.GenerateRequest) (promptTokens, window int, ok bool) {
+	m.mu.Lock()
+	e, found := m.entries[id]
+	m.mu.Unlock()
+	if !found {
+		return 0, 0, false
+	}
+	if !e.mu.TryLock() {
+		return 0, 0, false
+	}
+	defer e.mu.Unlock()
+	if !e.loaded {
+		return 0, 0, false
+	}
+
+	window = m.effectiveWindow(id, e.info)
+	promptTokens, err := e.engine.CountPromptTokens(req)
+	if err != nil || promptTokens <= 0 {
+		return 0, window, false
+	}
+	return promptTokens, window, true
+}
+
+// effectiveWindow resolves the model's context window: the loaded engine's
+// reported length, then the registry entry, then the global max seq len.
+func (m *Manager) effectiveWindow(id string, info engine.ModelInfo) int {
+	window := info.ContextLength
+	if window == 0 {
+		if rm, ok := m.ModelByID(id); ok {
+			window = rm.ContextLength
+		}
+	}
+	if window == 0 {
+		window = m.cfg.MaxSeqLen
+	}
+	return window
+}
+
 // Generate acquires the model, runs generation, and releases it. It also
 // enforces the global concurrency limit.
 //
 // The concurrency slot (sem) and the per-entry lock are released by the deferred
-// calls above/below. This is safe even when the engine overruns: the native
-// engine bounds generation with the no-token guard and hard timeout, and waits
-// for the (cooperatively aborted) engine call to unwind before returning, so the
-// model lock is never released while engine code is still running.
+// calls above/below. This is safe even when the engine overruns: the manager's
+// own per-request watchdog owns the inactivity bound (the native engine's
+// no-token guard is a backstop), and the native engine bounds each generation
+// call with the hard timeout, then waits for the (cooperatively aborted) engine
+// call to unwind before returning, so the model lock is never released while
+// engine code is still running.
 func (m *Manager) Generate(ctx context.Context, id string, req engine.GenerateRequest, onToken engine.TokenFunc) (engine.Usage, error) {
 	if err := m.acquireSem(ctx); err != nil {
 		return engine.Usage{}, err
@@ -435,16 +474,17 @@ func (m *Manager) Generate(ctx context.Context, id string, req engine.GenerateRe
 	var last atomic.Int64
 	last.Store(time.Now().UnixNano())
 	prevProgress := req.OnProgress
-	note := func() {
+	// Tokens and engine progress both refresh the inactivity clock, but the
+	// caller's OnProgress is chained only into the progress path: it means
+	// "progress that has not produced a token yet" and must not fire per token.
+	req.OnProgress = func() {
 		last.Store(time.Now().UnixNano())
 		if prevProgress != nil {
 			prevProgress()
 		}
 	}
-	// Engine prefill progress counts as activity exactly like a token does.
-	req.OnProgress = note
 	wrapped := func(t engine.Token) bool {
-		note()
+		last.Store(time.Now().UnixNano())
 		if onToken == nil {
 			return true
 		}

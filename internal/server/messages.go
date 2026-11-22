@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -130,20 +131,25 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// One request context bounds the whole request: the prompt-window
+	// preflight, any model load, and generation (including streaming).
+	ctx, cancel := s.requestContext(r)
+	defer cancel()
+
 	// Reject an oversized prompt before opening a stream or generating. The
-	// streaming check only runs for a warm model (R1); the Anthropic error shape
-	// carries a type and message, but no code.
-	if err := s.checkContextWindow(r, modelID, genReq, req.Stream); err != nil {
+	// streaming check only runs for a warm, idle model (R1); the Anthropic error
+	// shape carries a type and message, but no code.
+	if err := s.checkContextWindow(ctx, modelID, genReq, req.Stream); err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
 
 	if req.Stream {
-		s.streamMessages(w, r, modelID, genReq)
+		s.streamMessages(w, ctx, modelID, genReq)
 		return
 	}
 
-	text, usage, genErr := s.generateText(r, modelID, genReq)
+	text, usage, genErr := s.generateText(ctx, modelID, genReq)
 	if genErr != nil {
 		s.writeMessagesError(w, genErr)
 		return
@@ -271,7 +277,7 @@ func writeAnthropicError(w http.ResponseWriter, status int, typ, msg string) {
 
 // streamMessages emits the Anthropic Messages SSE event sequence. There is no
 // [DONE] sentinel: the stream ends after message_stop.
-func (s *Server) streamMessages(w http.ResponseWriter, r *http.Request, modelID string, req engine.GenerateRequest) {
+func (s *Server) streamMessages(w http.ResponseWriter, ctx context.Context, modelID string, req engine.GenerateRequest) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeAnthropicError(w, http.StatusInternalServerError, "api_error", "streaming unsupported")
@@ -299,7 +305,7 @@ func (s *Server) streamMessages(w http.ResponseWriter, r *http.Request, modelID 
 	})
 
 	var b strings.Builder
-	usage, genErr := s.runStream(w, r, modelID, req, func(text string) {
+	usage, genErr := s.runStream(ctx, modelID, req, func(text string) {
 		b.WriteString(text)
 		sw.writeEvent("content_block_delta", map[string]any{
 			"type": "content_block_delta", "index": 0,

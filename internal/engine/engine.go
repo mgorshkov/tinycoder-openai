@@ -23,9 +23,9 @@ var (
 	ErrNotLoaded = errors.New("model not loaded")
 	// ErrContextCanceled wraps StopIteration from a canceled request.
 	ErrContextCanceled = errors.New("generation canceled")
-	// ErrNoToken indicates no token was produced within the configured
-	// no-token timeout. It surfaces a hung/misconfigured engine as a bounded
-	// (non-200) failure instead of letting the request wedge forever.
+	// ErrNoToken indicates no token and no progress was reported within the
+	// configured inactivity window. It surfaces a hung/misconfigured engine as a
+	// bounded (non-200) failure instead of letting the request wedge forever.
 	ErrNoToken = errors.New("no token produced within timeout")
 	// ErrContextLength indicates the prompt does not fit the model's context
 	// window. The callers map it to a client error instead of streaming an

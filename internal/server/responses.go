@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -119,19 +120,24 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// One request context bounds the whole request: the prompt-window
+	// preflight, any model load, and generation (including streaming).
+	ctx, cancel := s.requestContext(r)
+	defer cancel()
+
 	// Reject an oversized prompt before opening a stream or generating. The
-	// streaming check only runs for a warm model (R1).
-	if err := s.checkContextWindow(r, modelID, genReq, req.Stream); err != nil {
+	// streaming check only runs for a warm, idle model (R1).
+	if err := s.checkContextWindow(ctx, modelID, genReq, req.Stream); err != nil {
 		writeResponsesRequestError(w, err)
 		return
 	}
 
 	if req.Stream {
-		s.streamResponses(w, r, modelID, genReq)
+		s.streamResponses(w, ctx, modelID, genReq)
 		return
 	}
 
-	text, usage, genErr := s.generateText(r, modelID, genReq)
+	text, usage, genErr := s.generateText(ctx, modelID, genReq)
 	if genErr != nil {
 		s.writeGenerateError(w, genErr)
 		return
@@ -158,10 +164,9 @@ func (s *Server) responsesEngineRequest(req responsesRequest) (string, engine.Ge
 	return modelID, genReq, nil
 }
 
-// generateText runs one blocking generation and returns its full text.
-func (s *Server) generateText(r *http.Request, modelID string, genReq engine.GenerateRequest) (string, engine.Usage, error) {
-	ctx, cancel := s.requestContext(r)
-	defer cancel()
+// generateText runs one blocking generation on the request context and returns
+// its full text.
+func (s *Server) generateText(ctx context.Context, modelID string, genReq engine.GenerateRequest) (string, engine.Usage, error) {
 	var b strings.Builder
 	usage, err := s.mgr.Generate(ctx, modelID, genReq, func(t engine.Token) bool {
 		b.WriteString(t.Text)
@@ -277,7 +282,7 @@ func newResponsesResponse(modelID, text string, usage engine.Usage, req engine.G
 // streamResponses emits the Responses API SSE event sequence. Unlike Chat
 // Completions there is no [DONE] sentinel: the stream ends after the terminal
 // response.completed (or response.failed) event.
-func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, modelID string, req engine.GenerateRequest) {
+func (s *Server) streamResponses(w http.ResponseWriter, ctx context.Context, modelID string, req engine.GenerateRequest) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "streaming unsupported", "server_error", "")
@@ -318,7 +323,7 @@ func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, modelID
 	})
 
 	var b strings.Builder
-	usage, genErr := s.runStream(w, r, modelID, req, func(text string) {
+	usage, genErr := s.runStream(ctx, modelID, req, func(text string) {
 		b.WriteString(text)
 		sw.writeEvent("response.output_text.delta", map[string]any{
 			"type": "response.output_text.delta", "item_id": msgID, "output_index": 0,
