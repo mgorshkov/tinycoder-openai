@@ -199,6 +199,10 @@ func (s *Server) writeMessagesError(w http.ResponseWriter, err error) {
 		writeAnthropicError(w, http.StatusGatewayTimeout, "api_error", err.Error())
 	case errors.Is(err, engine.ErrContextCanceled):
 		writeAnthropicError(w, http.StatusGatewayTimeout, "api_error", "generation canceled")
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		// A manager/acquisition deadline (or a shutdown-canceled request) is a
+		// 504 on the OpenAI surfaces; keep the Messages API consistent.
+		writeAnthropicError(w, http.StatusGatewayTimeout, "api_error", "generation canceled")
 	case errors.Is(err, engine.ErrNotLoaded):
 		writeAnthropicError(w, http.StatusConflict, "api_error", "model not loaded")
 	default:

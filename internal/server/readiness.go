@@ -29,6 +29,11 @@ type readinessResponse struct {
 // StartPreload warms the configured models in the background so an orchestrator
 // can hold traffic until /readyz turns 200. It returns immediately; readiness
 // reports progress. It is a no-op when no model is configured for preload.
+//
+// Embedder contract: a Server constructed with preload targets that never calls
+// StartPreload reports "loading" on /readyz for those targets (the warm-up
+// goroutine is never started, so they are not warm). The shipped main always
+// calls it; embedders that configure preload must do the same.
 func (s *Server) StartPreload() {
 	ids := s.cfg.PreloadIDs()
 	if len(ids) == 0 {
