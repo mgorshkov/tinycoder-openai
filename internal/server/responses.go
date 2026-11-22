@@ -119,8 +119,9 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Reject an oversized prompt before opening a stream or generating.
-	if err := s.checkContextWindow(r, modelID, genReq); err != nil {
+	// Reject an oversized prompt before opening a stream or generating. The
+	// streaming check only runs for a warm model (R1).
+	if err := s.checkContextWindow(r, modelID, genReq, req.Stream); err != nil {
 		writeResponsesRequestError(w, err)
 		return
 	}
@@ -326,10 +327,14 @@ func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, modelID
 	})
 	if genErr != nil {
 		stopHB()
+		code := "server_error"
+		if errors.Is(genErr, engine.ErrContextLength) {
+			code = "context_length_exceeded"
+		}
 		failed := responsesResponse{
 			ID: respID, Object: "response", CreatedAt: created, Status: "failed",
 			Model: modelID, Output: []responsesOutputItem{}, Tools: []any{}, ToolChoice: "auto",
-			Error: &responsesError{Code: "server_error", Message: "generation failed: " + genErr.Error()},
+			Error: &responsesError{Code: code, Message: "generation failed: " + genErr.Error()},
 		}
 		sw.writeEvent("response.failed", map[string]any{
 			"type": "response.failed", "response": failed,

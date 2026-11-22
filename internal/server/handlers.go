@@ -152,9 +152,9 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, chatRe
 	}
 
 	// Reject a prompt that cannot fit the model's window before opening any
-	// stream: the engine refuses it by returning zero tokens without an error,
-	// which would otherwise surface as an empty, successful completion.
-	if err := s.checkContextWindow(r, modelID, genReq); err != nil {
+	// stream. Streaming requests are only preflighted when the model is already
+	// warm (see checkContextWindow): a cold stream opens immediately, as before.
+	if err := s.checkContextWindow(r, modelID, genReq, req.Stream); err != nil {
 		s.writeGenerateError(w, err)
 		return
 	}
@@ -334,13 +334,24 @@ func (s *Server) buildRequest(req generationRequest, chatRequired bool, toolInst
 }
 
 // checkContextWindow is the shared prompt-window preflight for every generation
-// endpoint. It runs before any stream headers are written, so an oversized
-// prompt is a clean 400 rather than an empty SSE stream.
+// endpoint.
+//
+// Non-streaming requests always preflight: the model may be loaded here, and an
+// over-long prompt is an HTTP 400 written before anything else. Streaming
+// requests preflight only when the model is already resident (warm), so a warm
+// over-long prompt still gets a clean 400 before any SSE header. A cold
+// streaming request skips the check and opens the stream immediately (role
+// chunk + keep-alives), preserving the no-silent-load guarantee; an over-long
+// prompt then surfaces through the engine-refusal fallback as an SSE error
+// event carrying code "context_length_exceeded" instead of an empty success.
 //
 // It is best-effort: a failure to determine the prompt size (tokenizer
 // unavailable, model load error) returns nil, leaving generation to surface the
 // error as it did before.
-func (s *Server) checkContextWindow(r *http.Request, modelID string, genReq engine.GenerateRequest) error {
+func (s *Server) checkContextWindow(r *http.Request, modelID string, genReq engine.GenerateRequest, streaming bool) error {
+	if streaming && !s.mgr.IsLoaded(modelID) {
+		return nil
+	}
 	ctx, cancel := s.requestContext(r)
 	defer cancel()
 
