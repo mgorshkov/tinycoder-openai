@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -145,8 +146,26 @@ func builtinModels() []RegistryModel {
 	}
 }
 
+// configKeyTags maps each lower-cased Config JSON tag to its canonical
+// spelling, so top-level file keys can be matched case-insensitively.
+var configKeyTags = func() map[string]string {
+	t := reflect.TypeOf(Config{})
+	tags := make(map[string]string, t.NumField())
+	for i := 0; i < t.NumField(); i++ {
+		tag := strings.Split(t.Field(i).Tag.Get("json"), ",")[0]
+		if tag == "" || tag == "-" {
+			continue
+		}
+		tags[strings.ToLower(tag)] = tag
+	}
+	return tags
+}()
+
 // Load reads a JSON config file and overlays it on the defaults. A missing
-// path is not an error (defaults are returned unchanged).
+// path is not an error (defaults are returned unchanged). A "models" key
+// present in the file (in any case) replaces the built-in registry exactly,
+// with zero-value fields for anything the file omits; a file without a
+// "models" key keeps the built-in list.
 func Load(path string) (Config, error) {
 	cfg := Default()
 	if path == "" {
@@ -159,11 +178,22 @@ func Load(path string) (Config, error) {
 		}
 		return cfg, fmt.Errorf("read config %q: %w", path, err)
 	}
-	// Decode into an overlay struct so absent keys keep defaults.
+	// Decode into an overlay map so absent keys keep defaults.
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return cfg, fmt.Errorf("parse config %q: %w", path, err)
 	}
+	// Canonicalise the file's top-level keys against the Config JSON tags so
+	// "Models", "MODELS" and "models" behave identically. Unknown keys are left
+	// as-is (the decoder ignores them).
+	normalized := make(map[string]json.RawMessage, len(raw))
+	for k, v := range raw {
+		if tag, ok := configKeyTags[strings.ToLower(k)]; ok {
+			k = tag
+		}
+		normalized[k] = v
+	}
+	raw = normalized
 	// Re-marshal merged: decode defaults then the file over the top.
 	merged, err := json.Marshal(cfg)
 	if err != nil {
@@ -180,10 +210,14 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return cfg, err
 	}
-	if err := json.Unmarshal(final, &cfg); err != nil {
+	// Decode into a fresh zero Config, never into the default-valued cfg: the
+	// JSON decoder reuses an existing slice's backing array and would let
+	// fields the file omits keep the built-in model's values at the same index.
+	var out Config
+	if err := json.Unmarshal(final, &out); err != nil {
 		return cfg, fmt.Errorf("apply config %q: %w", path, err)
 	}
-	return cfg, nil
+	return out, nil
 }
 
 // ApplyEnv overlays environment variables (TINYCODER_*).
