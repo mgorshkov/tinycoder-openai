@@ -45,8 +45,10 @@ type Config struct {
 	DefaultMaxTokens  int      `json:"default_max_tokens"`
 	MaxPromptTokens   int      `json:"max_prompt_tokens"`
 	RequestTimeoutSec int      `json:"request_timeout_sec"`
-	// NoTokenTimeoutSec aborts a generation that produces no token for this
-	// many seconds (a hung load/prefill guard). 0 disables.
+	// NoTokenTimeoutSec aborts a generation when neither a token nor an engine
+	// prefill-progress event arrives for this many seconds; 0 disables the guard
+	// (the default), and request_timeout_sec / hard_timeout_sec remain the
+	// wall-clock bounds.
 	NoTokenTimeoutSec int `json:"no_token_timeout_sec"`
 	// HardTimeoutSec bounds the total wall-clock time of one generation; when
 	// exceeded the engine worker is abandoned and the request fails, so the
@@ -81,7 +83,7 @@ func Default() Config {
 		DefaultMaxTokens:  2048,
 		MaxPromptTokens:   32768,
 		RequestTimeoutSec: 600,
-		NoTokenTimeoutSec: 120,
+		NoTokenTimeoutSec: 0,
 		HardTimeoutSec:    660,
 		// 0 means "one slot per registered model", resolved in Validate. The
 		// engine runs one request at a time, so this bounds how many requests may
