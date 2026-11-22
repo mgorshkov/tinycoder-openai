@@ -34,6 +34,10 @@ func (s *Server) StartPreload() {
 	if len(ids) == 0 {
 		return
 	}
+	if len(ids) > s.cfg.MaxLoadedModels {
+		s.log.Warn("more models configured for preload than can stay resident; earlier targets will be evicted",
+			"preload_targets", len(ids), "max_loaded_models", s.cfg.MaxLoadedModels)
+	}
 	s.log.Info("preloading models", "models", ids)
 	go s.mgr.Preload(context.Background(), ids)
 }
@@ -61,6 +65,7 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 // of that model through Acquire clears the error.
 func (m *Manager) Preload(ctx context.Context, ids []string) {
 	for _, id := range ids {
+		m.recordPreloadStart(id)
 		if err := m.preloadOne(ctx, id); err != nil {
 			m.log.Error("preload failed", "model", id, "err", err)
 			m.recordPreloadError(id, err)
@@ -70,12 +75,13 @@ func (m *Manager) Preload(ctx context.Context, ids []string) {
 	}
 }
 
-// preloadOne performs one bounded Acquire/Release warm-up. Acquire hands the
-// deadline to Engine.Load, so the budget is enforced only by engines that honor
-// context cancellation; the synchronous native load cannot be interrupted and
-// may outlast it.
+// preloadOne performs one bounded Acquire/Release warm-up. The budget is handed
+// to Engine.Load through the context, but the synchronous native load is a
+// blocking C call that ignores cancellation: the engine call can outlast the
+// deadline. Readiness therefore also reports the budget expiry from the recorded
+// start time (see Readiness) while the load is still unwinding.
 func (m *Manager) preloadOne(ctx context.Context, id string) error {
-	timeout := time.Duration(m.cfg.PreloadTimeoutSec) * time.Second
+	timeout := m.preloadMax
 	if timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
@@ -84,7 +90,7 @@ func (m *Manager) preloadOne(ctx context.Context, id string) error {
 	lease, err := m.Acquire(ctx, id)
 	if err != nil {
 		if timeout > 0 && errors.Is(err, context.DeadlineExceeded) {
-			return fmt.Errorf("warm-up timed out after %s", timeout)
+			return errors.New(warmupTimeoutMessage(timeout))
 		}
 		return err
 	}
@@ -92,9 +98,20 @@ func (m *Manager) preloadOne(ctx context.Context, id string) error {
 	return nil
 }
 
+// warmupTimeoutMessage renders the warm-up budget in whole seconds, matching the
+// configured unit ("300s", not "5m0s").
+func warmupTimeoutMessage(budget time.Duration) string {
+	return fmt.Sprintf("warm-up timed out after %ds", int(budget/time.Second))
+}
+
 // Readiness reports the preload status ("ready", "loading" or "error") and one
 // entry per id. With no ids there is nothing to wait for: a lazily loaded
 // server is ready immediately.
+//
+// A target that is not warm after its recorded start plus the configured budget
+// is reported as an error even if the engine load is still blocked and has not
+// returned: the budget is reporting-only because a native load cannot be
+// canceled.
 func (m *Manager) Readiness(ids []string) (string, []ModelReadiness) {
 	models := make([]ModelReadiness, 0, len(ids))
 	if len(ids) == 0 {
@@ -106,11 +123,16 @@ func (m *Manager) Readiness(ids []string) (string, []ModelReadiness) {
 	anyErr := false
 	for _, id := range ids {
 		mr := ModelReadiness{ID: id, Loaded: m.warm[id]}
-		if msg, ok := m.preloadErrs[id]; ok && !mr.Loaded {
-			mr.Error = msg
-			anyErr = true
-		}
 		if !mr.Loaded {
+			if msg, ok := m.preloadErrs[id]; ok {
+				mr.Error = msg
+				anyErr = true
+			} else if m.preloadMax > 0 {
+				if start, ok := m.preloadAt[id]; ok && time.Since(start) >= m.preloadMax {
+					mr.Error = warmupTimeoutMessage(m.preloadMax)
+					anyErr = true
+				}
+			}
 			allLoaded = false
 		}
 		models = append(models, mr)
@@ -127,13 +149,23 @@ func (m *Manager) Readiness(ids []string) (string, []ModelReadiness) {
 	}
 }
 
+// recordPreloadStart remembers when a target's warm-up began, so Readiness can
+// report a budget expiry even when the engine load ignores cancellation.
+func (m *Manager) recordPreloadStart(id string) {
+	m.preloadMu.Lock()
+	m.preloadAt[id] = time.Now()
+	m.preloadMu.Unlock()
+}
+
 // recordWarm marks a model as successfully warmed and clears any previous
-// warm-up error. It is called on every successful Acquire, so a lazy request
-// (or a retried warm-up) repairs readiness after a failed preload.
+// warm-up error (and its start time). It is called on every successful Acquire,
+// so a lazy request (or a retried warm-up) repairs readiness after a failed
+// preload.
 func (m *Manager) recordWarm(id string) {
 	m.preloadMu.Lock()
 	m.warm[id] = true
 	delete(m.preloadErrs, id)
+	delete(m.preloadAt, id)
 	m.preloadMu.Unlock()
 }
 

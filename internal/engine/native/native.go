@@ -131,6 +131,12 @@ func (e *Engine) queryInfo() engine.ModelInfo {
 	}
 }
 
+// contextRefusal reports whether a zero-token generation must be reported as
+// a context-length refusal instead of an empty success.
+func contextRefusal(generated, promptTokens, window int) bool {
+	return generated == 0 && window > 0 && promptTokens > window
+}
+
 // formatChat renders messages through the model's own chat template.
 func (e *Engine) formatChat(messages []engine.Message, addGenerationPrompt bool) (string, error) {
 	n := len(messages)
@@ -297,7 +303,7 @@ func (e *Engine) Generate(ctx context.Context, req engine.GenerateRequest, onTok
 			return usage, engine.ErrContextCanceled
 		case gc.noToken.Load():
 			return usage, engine.ErrNoToken
-		case generated == 0 && e.info.ContextLength > 0 && usage.PromptTokens > int(e.info.ContextLength):
+		case contextRefusal(generated, usage.PromptTokens, int(e.info.ContextLength)):
 			// The engine refuses an oversized prompt without an error: forward()
 			// returns nothing and model->generate reports zero tokens. Detect it
 			// from the request itself (the engine-level signal is not reliable for

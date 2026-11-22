@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -46,9 +47,10 @@ func (e *progressEngine) Generate(ctx context.Context, req engine.GenerateReques
 	}
 }
 
-// hungEngine never emits a token and never reports progress. It returns as soon
-// as the request context is canceled (a hung engine), or after block if block is
-// positive (used to prove the guard can be disabled).
+// hungEngine never emits a token and never reports progress. It returns
+// engine.ErrContextCanceled as soon as the request context is canceled (the
+// native engine's cooperative abort), or after block if block is positive (used
+// to prove the guard can be disabled).
 type hungEngine struct {
 	*engine.Stub
 	block time.Duration
@@ -58,13 +60,13 @@ func (e *hungEngine) Generate(ctx context.Context, req engine.GenerateRequest, o
 	if e.block > 0 {
 		select {
 		case <-ctx.Done():
-			return engine.Usage{}, ctx.Err()
+			return engine.Usage{}, engine.ErrContextCanceled
 		case <-time.After(e.block):
 			return engine.Usage{}, nil
 		}
 	}
 	<-ctx.Done()
-	return engine.Usage{}, ctx.Err()
+	return engine.Usage{}, engine.ErrContextCanceled
 }
 
 // A long prefill that emits no token but keeps reporting engine progress must
@@ -134,6 +136,42 @@ func TestNoTokenWatchdogAbortsHungEngine(t *testing.T) {
 	}
 	if elapsed > time.Second {
 		t.Fatalf("hung engine aborted after %s, want well under a second", elapsed)
+	}
+}
+
+// lateErrorEngine outlives the inactivity window (ignoring cancellation) and
+// then returns a genuine engine failure.
+type lateErrorEngine struct {
+	*engine.Stub
+	delay time.Duration
+}
+
+func (e *lateErrorEngine) Generate(ctx context.Context, req engine.GenerateRequest, onToken engine.TokenFunc) (engine.Usage, error) {
+	time.Sleep(e.delay)
+	return engine.Usage{}, errors.New("kernel launched a bad grid")
+}
+
+// A genuine engine error must win over a simultaneously tripped watchdog; only
+// a nil/canceled result is rewritten to ErrNoToken.
+func TestNoTokenWatchdogDoesNotMaskEngineError(t *testing.T) {
+	mgr := newWatchdogManager(t, func(id string) engine.Engine {
+		return &lateErrorEngine{Stub: engine.NewStub(id), delay: 120 * time.Millisecond}
+	})
+
+	start := time.Now()
+	_, err := mgr.Generate(context.Background(), "alpha", engine.GenerateRequest{
+		Prompt:         "hi",
+		MaxTokens:      8,
+		NoTokenTimeout: 30 * time.Millisecond,
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "bad grid") {
+		t.Fatalf("Generate returned %v, want the engine's own error", err)
+	}
+	if errors.Is(err, engine.ErrNoToken) {
+		t.Fatalf("Generate returned %v, want the genuine engine error, not ErrNoToken", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Generate returned after %s, want well under a second", elapsed)
 	}
 }
 
