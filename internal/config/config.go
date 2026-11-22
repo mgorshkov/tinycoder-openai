@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -162,10 +163,11 @@ var configKeyTags = func() map[string]string {
 }()
 
 // Load reads a JSON config file and overlays it on the defaults. A missing
-// path is not an error (defaults are returned unchanged). A "models" key
-// present in the file (in any case) replaces the built-in registry exactly,
-// with zero-value fields for anything the file omits; a file without a
-// "models" key keeps the built-in list.
+// path is not an error (defaults are returned unchanged). An explicit JSON
+// null for a key keeps that field's default. A "models" key present in the
+// file (in any case) replaces the built-in registry exactly, with zero-value
+// fields for anything the file omits; a file without a "models" key keeps the
+// built-in list.
 func Load(path string) (Config, error) {
 	cfg := Default()
 	if path == "" {
@@ -183,15 +185,43 @@ func Load(path string) (Config, error) {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return cfg, fmt.Errorf("parse config %q: %w", path, err)
 	}
-	// Canonicalise the file's top-level keys against the Config JSON tags so
-	// "Models", "MODELS" and "models" behave identically. Unknown keys are left
-	// as-is (the decoder ignores them).
+	// Resolve the file's top-level keys against the Config JSON tags so
+	// "Models", "MODELS" and "models" behave identically, and drop null values
+	// so an explicit null keeps the default (the decoder would otherwise zero
+	// non-pointer fields, unlike a no-op overlay). Unknown keys are left as-is
+	// (the decoder ignores them). Keys are processed in sorted order: when the
+	// exact canonical spelling is present it wins, otherwise the
+	// lexicographically smallest case variant wins, so duplicate variants never
+	// race on map iteration order.
+	keys := make([]string, 0, len(raw))
+	for k := range raw {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
 	normalized := make(map[string]json.RawMessage, len(raw))
-	for k, v := range raw {
-		if tag, ok := configKeyTags[strings.ToLower(k)]; ok {
-			k = tag
+	for _, k := range keys {
+		v := raw[k]
+		if strings.TrimSpace(string(v)) == "null" {
+			continue
 		}
-		normalized[k] = v
+		tag, known := configKeyTags[strings.ToLower(k)]
+		if !known {
+			normalized[k] = v
+			continue
+		}
+		if tag == k {
+			normalized[tag] = v
+			continue
+		}
+		// A case variant applies only when the canonical spelling is absent and
+		// no lexicographically smaller variant already claimed this tag.
+		if _, exact := raw[tag]; exact {
+			continue
+		}
+		if _, claimed := normalized[tag]; claimed {
+			continue
+		}
+		normalized[tag] = v
 	}
 	raw = normalized
 	// Re-marshal merged: decode defaults then the file over the top.
