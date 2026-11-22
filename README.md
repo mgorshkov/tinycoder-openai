@@ -157,6 +157,13 @@ The base URL is `https://api.tinycoder.dev/v1`, so all content endpoints live
 under the `/v1` prefix (e.g. `/v1/models`, `/v1/chat/completions`). Only these
 paths are served — there are no unversioned or legacy aliases.
 
+A prompt longer than the model's context window is refused with HTTP `400` and
+`{"error":{"type":"invalid_request_error","code":"context_length_exceeded"}}` on
+every generation endpoint. Streaming requests preflight the prompt only when the
+model is already resident and idle, so a cold or busy stream instead surfaces the
+same refusal as an SSE error event carrying the same code — not an empty success
+with `finish_reason: "stop"`.
+
 ### Quick start
 
 All content endpoints require an API key when the server is configured with
@@ -412,9 +419,11 @@ served registry.
   and cancels it on client disconnect. `no_token_timeout_sec` (default `0`,
   disabled) guards against a hung engine: it aborts when neither a token nor a
   prefill-progress event arrives within the window, so a long prefill is not
-  mistaken for a hang. `hard_timeout_sec` is the last-resort wall-clock kill that
-  abandons an overrunning engine worker. Even with the no-token guard disabled,
-  `request_timeout_sec` and `hard_timeout_sec` bound every request.
+  mistaken for a hang. `hard_timeout_sec` bounds one generation call and its
+  abort is cooperative: an engine that stops polling the abort predicate cannot
+  be abandoned. Even with the no-token guard disabled, `request_timeout_sec`
+  bounds the whole request, including the prompt-window preflight and any model
+  load.
 - Cancellation is cooperative across the C ABI: an abort predicate is polled
   inside the engine's per-layer / per-block loop, not only at the token
   callback, so a stuck prefill can be interrupted. Timeouts and cancellation are

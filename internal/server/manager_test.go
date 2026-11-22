@@ -71,6 +71,7 @@ func (e *hungEngine) Generate(ctx context.Context, req engine.GenerateRequest, o
 // not trip the no-token watchdog: progress proves the engine is alive, even
 // though the request then runs for five times the inactivity window.
 func TestNoTokenWatchdogSurvivesPrefillProgress(t *testing.T) {
+	const window = 60 * time.Millisecond
 	mgr := newWatchdogManager(t, func(id string) engine.Engine {
 		return &progressEngine{
 			Stub:     engine.NewStub(id),
@@ -83,11 +84,17 @@ func TestNoTokenWatchdogSurvivesPrefillProgress(t *testing.T) {
 	_, err := mgr.Generate(context.Background(), "alpha", engine.GenerateRequest{
 		Prompt:         "hi",
 		MaxTokens:      8,
-		NoTokenTimeout: 60 * time.Millisecond,
+		NoTokenTimeout: window,
 	}, nil)
+	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("Generate returned %v after %s; a prefill that reports progress must not be aborted",
-			err, time.Since(start))
+			err, elapsed)
+	}
+	// Prove the request really outlived the inactivity window by a wide margin,
+	// so the test cannot pass trivially by finishing early.
+	if elapsed <= 3*window {
+		t.Fatalf("Generate returned after %s, want well past 3x the %s inactivity window", elapsed, window)
 	}
 }
 
@@ -98,12 +105,29 @@ func TestNoTokenWatchdogAbortsHungEngine(t *testing.T) {
 		return &hungEngine{Stub: engine.NewStub(id)}
 	})
 
+	type result struct {
+		err error
+	}
+	done := make(chan result, 1)
 	start := time.Now()
-	_, err := mgr.Generate(context.Background(), "alpha", engine.GenerateRequest{
-		Prompt:         "hi",
-		MaxTokens:      8,
-		NoTokenTimeout: 60 * time.Millisecond,
-	}, nil)
+	go func() {
+		_, err := mgr.Generate(context.Background(), "alpha", engine.GenerateRequest{
+			Prompt:         "hi",
+			MaxTokens:      8,
+			NoTokenTimeout: 60 * time.Millisecond,
+		}, nil)
+		done <- result{err: err}
+	}()
+
+	// Own deadline: a watchdog regression fails fast instead of hanging until
+	// the Go test timeout.
+	var err error
+	select {
+	case r := <-done:
+		err = r.err
+	case <-time.After(2 * time.Second):
+		t.Fatal("Generate did not return within 2s; the inactivity watchdog failed to abort a hung engine")
+	}
 	elapsed := time.Since(start)
 	if !errors.Is(err, engine.ErrNoToken) {
 		t.Fatalf("Generate returned %v, want engine.ErrNoToken", err)

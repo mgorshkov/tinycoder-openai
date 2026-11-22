@@ -22,6 +22,10 @@ import (
 type windowEngine struct {
 	*engine.Stub
 	generateCalls atomic.Int32
+	// countCalls counts CountPromptTokens invocations, which (unlike Generate)
+	// the stub does not call internally. A test uses it to prove the preflight
+	// actually tokenized the prompt.
+	countCalls atomic.Int32
 	// promptTokens, when positive, is the count returned for every request.
 	// Zero makes the engine count the request's characters instead (one per
 	// byte) so a test can drive the boundary precisely.
@@ -46,6 +50,7 @@ func (e *windowEngine) Info() engine.ModelInfo {
 }
 
 func (e *windowEngine) CountPromptTokens(req engine.GenerateRequest) (int, error) {
+	e.countCalls.Add(1)
 	if e.promptTokens > 0 {
 		return e.promptTokens, nil
 	}
@@ -252,7 +257,11 @@ func TestMessagesPromptTooLongStreamReturns400(t *testing.T) {
 }
 
 func TestChatPromptAtWindowStreams(t *testing.T) {
-	ts, eng, _ := newContextLengthServer(t, 1024, nil)
+	ts, eng, mgr := newContextLengthServer(t, 1024, nil)
+	// Warm the model so the streaming preflight actually runs: the boundary is
+	// only exercised when the request is cold otherwise (the check is skipped).
+	warmModel(t, mgr)
+	// The fake counts one token per byte, so this prompt is exactly the window.
 	exact := strings.Repeat("x", 1024)
 	body := fmt.Sprintf(`{"model":"alpha","stream":true,"messages":[{"role":"user","content":%q}]}`, exact)
 
@@ -263,7 +272,7 @@ func TestChatPromptAtWindowStreams(t *testing.T) {
 		t.Fatalf("status = %d, want 200 (a prompt exactly at the window must pass); body=%s", resp.StatusCode, raw)
 	}
 
-	var sawDone, sawStop bool
+	var sawContent, sawDone, sawStop bool
 	for _, ev := range readTestSSE(t, resp.Body) {
 		if ev.Data == "[DONE]" {
 			sawDone = true
@@ -274,10 +283,16 @@ func TestChatPromptAtWindowStreams(t *testing.T) {
 			t.Fatalf("bad chunk %q: %v", ev.Data, err)
 		}
 		for _, c := range chunk.Choices {
+			if c.Delta.Content != "" {
+				sawContent = true
+			}
 			if c.FinishReason == "stop" {
 				sawStop = true
 			}
 		}
+	}
+	if !sawContent {
+		t.Fatal("stream did not carry any generated content")
 	}
 	if !sawDone {
 		t.Fatal("stream did not terminate with [DONE]")
@@ -287,6 +302,12 @@ func TestChatPromptAtWindowStreams(t *testing.T) {
 	}
 	if got := eng.generateCalls.Load(); got != 1 {
 		t.Fatalf("Generate called %d time(s), want 1", got)
+	}
+	// Prove the warm streaming preflight actually tokenized the prompt (rather
+	// than the request being cold and skipping the check): this is what makes
+	// the exact-boundary assertion meaningful.
+	if got := eng.countCalls.Load(); got < 1 {
+		t.Fatal("the streaming preflight never counted the prompt; the exact-window boundary was not exercised")
 	}
 }
 
@@ -330,10 +351,12 @@ func TestMessagesPromptTooLongReturns400(t *testing.T) {
 	}
 }
 
-// TestEngineContextRefusalMapped covers the fallback path: the preflight passes
-// (a fitting prompt count) but the engine itself refuses the prompt mid-request.
-// The non-streaming response must be the same 400 body, and a stream must carry
-// the code in its SSE error frame and then terminate with [DONE].
+// TestEngineContextRefusalMapped covers the fallback path: the preflight does
+// not reject the request (non-streaming, it sees a fitting prompt count; the
+// streaming subtest runs cold, so its preflight is skipped) but the engine
+// itself refuses the prompt mid-request. The non-streaming response must be the
+// same 400 body, and a stream must carry the code in its SSE error frame and
+// then terminate with [DONE].
 func TestEngineContextRefusalMapped(t *testing.T) {
 	refusal := fmt.Errorf("%w: prompt is too long: 2000 tokens > 1024 maximum", engine.ErrContextLength)
 
@@ -350,9 +373,12 @@ func TestEngineContextRefusalMapped(t *testing.T) {
 
 	t.Run("stream", func(t *testing.T) {
 		ts, _, _ := newContextLengthServer(t, 1024, func(e *windowEngine) {
-			e.promptTokens = 1 // preflight passes; only the engine refuses
+			e.promptTokens = 1 // a fitting count; only the engine refuses
 			e.genErr = refusal
 		})
+		// This request is cold, so the streaming preflight is skipped entirely;
+		// the "preflight passes" wording would be false here. The engine refusal
+		// is what must be mapped.
 		body := `{"model":"alpha","stream":true,"messages":[{"role":"user","content":"hi"}]}`
 		resp := postJSON(t, ts.URL+"/v1/chat/completions", body)
 		defer resp.Body.Close()
